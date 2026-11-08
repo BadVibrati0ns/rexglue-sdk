@@ -1,3 +1,40 @@
+> [!NOTE]
+> **This is a fork of [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk)** with
+> performance work for the emulated (Xenos) GPU path, meant to help any Xbox 360 game built on
+> ReXGlue. The `patched` branch is upstream **v0.10.0** plus the changes below. Everything else
+> in this README is upstream's.
+>
+> **Credit.** The emulated GPU work in this fork is the SDK patch from
+> **[Proving Ground Recompiled](https://github.com/Newbie1337x/ProvingGroundRecomp)** by
+> **Tomas cabrera ([Newbie1337x](https://github.com/Newbie1337x))**:
+> `patches/rexglue-sdk.patch` at
+> [`4e884d0`](https://github.com/Newbie1337x/ProvingGroundRecomp/commit/4e884d0383c64d6d005d21fe4d3f60daa93c1c78),
+> applied unchanged as commit `37a3b0c`, which carries its author's name. Per that project's
+> license, the patch is under this SDK's BSD 3-Clause license. It includes a vblank deadline
+> wait adapted from the **Tony Hawk's Project 8 recompilation project** (Project8Recomp),
+> BSD 3-Clause; its license is in [`LICENSES/`](LICENSES/Project8Recomp-BSD-3-Clause.txt).
+> Thank you to both projects.
+>
+> **What the patch changes** (all of it behind options, most on by default):
+>
+> - Command processor: a known-register bitset instead of a register-info lookup on every
+>   register write, and type-0 packets written as ranges (`gpu_type0_register_ranges`).
+> - Vulkan: submission on a second thread (`vulkan_async_submission`), descriptor-set reuse,
+>   merged draw binds, dynamic constant buffers, cached sampler parameters and texture lookups.
+> - Shared memory: pages the CPU keeps rewriting are compared instead of write-protected
+>   (`shared_memory_hot_page_uploads`), upload windows, fewer redundant re-protections, and
+>   invalidations that stop at texture watches.
+> - Render targets: transfers skipped when a full-screen rectangle overwrites them.
+> - Vblank pacing options (`vblank_after_swap`, a deadline wait), performance counters and
+>   timelines, and FSR 3.1 / FSR 4 presenter paths (FidelityFX, optional at build time).
+>
+> **Measured** in a Tony Hawk's Proving Ground recompilation (same input replay over the same
+> stretch of gameplay, emulated renderer at 720p internal, RTX 4090 Laptop, Linux): 50.6 fps on
+> stock v0.10.0, 154.3 fps on this branch.
+>
+> Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
+> each game's own project.
+
 > [!CAUTION]
 > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
 
