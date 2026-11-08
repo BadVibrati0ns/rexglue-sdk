@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -274,8 +276,34 @@ class VulkanDevice {
   // May be the same as queue_family_graphics_compute().
   uint32_t queue_family_sparse_binding() const { return queue_family_sparse_binding_; }
 
+  // Queue work that a thread submits after the caller has moved on. Other threads let it reach
+  // the queue first, so the order of submissions stays the order they were made in.
+  class QueueOrdering {
+   public:
+    virtual ~QueueOrdering() = default;
+    // Waits until the pending work has been submitted; no-op on the submitting thread.
+    virtual void Drain() = 0;
+    virtual void Enqueue(std::function<void()> work) = 0;
+  };
+  void SetQueueOrdering(QueueOrdering* queue_ordering) const {
+    queue_ordering_.store(queue_ordering, std::memory_order_release);
+  }
+  // Runs queue work after the pending work, or immediately if there is no ordering. Returns
+  // whether the work was queued.
+  bool RunInQueueOrder(std::function<void()> work) const {
+    QueueOrdering* queue_ordering = queue_ordering_.load(std::memory_order_acquire);
+    if (!queue_ordering) {
+      return false;
+    }
+    queue_ordering->Enqueue(std::move(work));
+    return true;
+  }
+
   Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
                                   const uint32_t queue_index) const {
+    if (QueueOrdering* queue_ordering = queue_ordering_.load(std::memory_order_acquire)) {
+      queue_ordering->Drain();
+    }
     return queue_families()[queue_family_index].queues[queue_index]->Acquire();
   }
 
@@ -306,6 +334,8 @@ class VulkanDevice {
   uint32_t queue_family_sparse_binding_ = UINT32_MAX;
 
   MemoryTypes memory_types_;
+
+  mutable std::atomic<QueueOrdering*> queue_ordering_{nullptr};
 };
 
 }  // namespace vulkan

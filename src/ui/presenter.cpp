@@ -40,11 +40,19 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
+// The temporal upscalers need the FidelityFX runtime; CAS and FSR 1 do not.
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, cas, fsr")
+    .allowed({"bilinear", "cas", "fsr"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -92,7 +100,7 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   std::string lowered = effect_name;
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char c) { return char(std::tolower(c)); });
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   if (lowered == "cas") {
     return GuestOutputPaintConfig::Effect::kCas;
   }
@@ -109,7 +117,7 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   return GuestOutputPaintConfig::Effect::kBilinear;
 }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
 bool IsTemporalFsrCompatibilityEffect(GuestOutputPaintConfig::Effect effect) {
   return effect == GuestOutputPaintConfig::Effect::kFsr2 ||
          effect == GuestOutputPaintConfig::Effect::kFsr3;
@@ -249,19 +257,19 @@ void LogTemporalFsrQualityModeInputLimitOnce() {
         "guest output; using guest output size");
   }
 }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+#endif  // defined(REX_HAS_FFX_SPATIAL)
 
 GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   GuestOutputPaintConfig config;
   GuestOutputPaintConfig::Effect parsed_effect = ParsePresentEffect(REXCVAR_GET(present_effect));
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   if (IsTemporalFsrCompatibilityEffect(parsed_effect)) {
     LogTemporalFsrCompatibilityPathOnce();
   }
 #endif
   config.SetAllowOverscanCutoff(REXCVAR_GET(present_allow_overscan_cutoff));
   config.SetEffect(parsed_effect);
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   config.SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
   config.SetFsrMaxUpsamplingPasses(
       uint32_t(std::max(int32_t(1), REXCVAR_GET(present_fsr_max_upsampling_passes))));
@@ -659,7 +667,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     request_repaint = true;
   }
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
       new_config.GetFsrSharpnessReduction()) {
     modified = true;
@@ -684,7 +692,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     request_repaint = true;
   }
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   if (guest_output_paint_config_.GetFsrQualityMode() != new_config.GetFsrQualityMode()) {
     modified = true;
     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
@@ -1030,7 +1038,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
@@ -1145,7 +1153,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                                               : GuestOutputPaintEffect::kCasResample;
     }
   }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+#endif  // defined(REX_HAS_FFX_SPATIAL)
 
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;
@@ -1156,7 +1164,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     // Clamp the output size of the last effect to the maximum render target
     // size because it will go to an intermediate image now.
     if (last_pre_bilinear_effect_size) {
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       // RCAS only works for 1:1, clamping must be done explicitly for FSR.
       assert_false(flow.effects[flow.effect_count - 1] == GuestOutputPaintEffect::kFsrRcas &&
                    (last_pre_bilinear_effect_size->first > max_rt_width ||
@@ -1188,7 +1196,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
           last_effect = GuestOutputPaintEffect::kBilinearDither;
         }
         break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       case GuestOutputPaintEffect::kCasSharpen:
         last_effect = GuestOutputPaintEffect::kCasSharpenDither;
         break;

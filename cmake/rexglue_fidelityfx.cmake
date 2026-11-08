@@ -58,6 +58,21 @@ if(NOT fidelityfx_POPULATED)
     FetchContent_Populate(fidelityfx)
 endif()
 
+# The Vulkan frame interpolation swapchain passes temporaries to non-const references, which
+# only MSVC accepts; give them names so clang builds it.
+set(_rexglue_fi_swapchain
+    "${fidelityfx_SOURCE_DIR}/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp")
+file(READ "${_rexglue_fi_swapchain}" _rexglue_fi_source)
+string(REPLACE "presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());"
+    "SubmissionSemaphores toSignal; presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, toSignal);"
+    _rexglue_fi_patched "${_rexglue_fi_source}")
+string(REPLACE "res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());"
+    "SubmissionSemaphores toSignal; res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, toSignal);"
+    _rexglue_fi_patched "${_rexglue_fi_patched}")
+if(NOT _rexglue_fi_patched STREQUAL _rexglue_fi_source)
+    file(WRITE "${_rexglue_fi_swapchain}" "${_rexglue_fi_patched}")
+endif()
+
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
@@ -104,13 +119,23 @@ if(REXGLUE_USE_VULKAN AND REXGLUE_USE_D3D12)
 endif()
 
 # ── Build FidelityFX ─────────────────────────────────────────────────────
-set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+option(REXGLUE_FIDELITYFX_FRAMEGEN "Build the FidelityFX frame generation providers" ON)
+set(FFX_API_ENABLE_FRAMEGEN_PROVIDER ${REXGLUE_FIDELITYFX_FRAMEGEN} CACHE BOOL "" FORCE)
 if(WIN32)
     set(FFX_API_AUTO_COMPILE_SHADERS ON CACHE BOOL "" FORCE)
 else()
     set(FFX_API_AUTO_COMPILE_SHADERS OFF CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${fidelityfx_SOURCE_DIR}/ffx-api" "${fidelityfx_BINARY_DIR}/ffx-api" EXCLUDE_FROM_ALL)
+# The backends hook the frame generation swapchain only with this, which upstream sets on the API
+# library alone.
+if(REXGLUE_FIDELITYFX_FRAMEGEN)
+    foreach(_rexglue_ffx_backend ffx_backend_vk_x64 ffx_backend_dx12_x64)
+        if(TARGET ${_rexglue_ffx_backend})
+            target_compile_definitions(${_rexglue_ffx_backend} PRIVATE FFX_API_ENABLE_FRAMEGEN_PROVIDER=1)
+        endif()
+    endforeach()
+endif()
 
 # The upstream FidelityFX targets expose source-tree include paths in
 # INTERFACE_INCLUDE_DIRECTORIES, which breaks our install export checks.

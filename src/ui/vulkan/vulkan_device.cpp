@@ -397,6 +397,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
        ++queue_family_index) {
     QueueFamily& queue_family = device->queue_families_[queue_family_index];
     const VkQueueFamilyProperties& queue_family_properties = queue_families[queue_family_index];
+    queue_family.queue_flags = queue_family_properties.queueFlags;
 
     const VkQueueFlags queue_unsupported_flags = ~queue_family_properties.queueFlags;
 
@@ -478,11 +479,25 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     device->queue_family_sparse_binding_ = first_queue_family_sparse_binding;
   }
 
+  // Up to four graphics and compute queues: index 0 is used for everything, the rest are for
+  // FidelityFX frame generation, which presents, acquires and may compute from its own threads.
   device->queue_families_[device->queue_family_graphics_compute_].queues.resize(std::max(
-      size_t(1), device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
+      size_t(std::clamp(queue_families[device->queue_family_graphics_compute_].queueCount,
+                        uint32_t(1), uint32_t(4))),
+      device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
+  }
+
+  // A queue of the first compute-only family, for asynchronous compute (FidelityFX frame
+  // generation), which runs alongside graphics work only from such families on some GPUs.
+  for (QueueFamily& queue_family : device->queue_families_) {
+    if ((queue_family.queue_flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+        VK_QUEUE_COMPUTE_BIT) {
+      queue_family.queues.resize(std::max(size_t(1), queue_family.queues.size()));
+      break;
+    }
   }
 
   size_t max_enabled_queues_per_family = 0;

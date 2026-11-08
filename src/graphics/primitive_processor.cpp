@@ -15,6 +15,7 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/perf/counter.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
@@ -36,7 +37,10 @@ REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
                     "Force convert triangle fans to lists");
 
-REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
+// 4096 as in Xenia: caching small draws costs a lookup, locking and page
+// protection per draw. In Proving Ground (16-bit primitive reset index
+// replacement) 0 cost about 7% FPS against 4096.
+REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 4096, "GPU",
                      "Minimum indices for primitive processor cache")
     .range(0, 1000000);
 
@@ -911,7 +915,12 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
-    if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
+    uint64_t request_start = rex::perf::ReadTicks();
+    shared_memory_.request_tag_ = 2;
+    bool requested = shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes);
+    shared_memory_.request_tag_ = 0;
+    index_request_ticks_ += rex::perf::ReadTicks() - request_start;
+    if (!requested) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
           "bytes needed, in the shared memory",

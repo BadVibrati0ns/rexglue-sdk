@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <map>
 #include <memory>
 #include <tuple>
 #include <utility>
@@ -36,6 +38,10 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_log_render_target_transfers, false, "GPU/Vulkan",
+                    "Log the most frequent render target transfers every 5 seconds")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
@@ -1377,6 +1383,45 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied && cleared;
 }
 
+bool VulkanRenderTargetCache::GetLastUpdateDepthRenderTarget(
+    uint32_t& key_out, uint32_t& pitch_tiles_at_32bpp_out) const {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  const RenderTarget* depth_render_target = last_update_accumulated_render_targets()[0];
+  if (!depth_render_target ||
+      depth_render_target->key().msaa_samples != xenos::MsaaSamples::k1X) {
+    return false;
+  }
+  key_out = depth_render_target->key().key;
+  pitch_tiles_at_32bpp_out = depth_render_target->key().pitch_tiles_at_32bpp;
+  return true;
+}
+
+VkImageView VulkanRenderTargetCache::UseDepthRenderTargetForComputeSampling(
+    uint32_t key_value) {
+  RenderTargetKey key;
+  key.key = key_value;
+  if (GetPath() != Path::kHostRenderTargets || !key.is_depth ||
+      key.msaa_samples != xenos::MsaaSamples::k1X) {
+    return VK_NULL_HANDLE;
+  }
+  auto* vulkan_rt = static_cast<VulkanRenderTarget*>(GetRenderTarget(key));
+  if (!vulkan_rt) {
+    return VK_NULL_HANDLE;
+  }
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_rt->image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                   VK_IMAGE_ASPECT_STENCIL_BIT),
+      vulkan_rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      vulkan_rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT, vulkan_rt->current_layout(),
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  vulkan_rt->SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  return vulkan_rt->view_depth_color();
+}
+
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -1397,8 +1442,64 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
+      const std::vector<Transfer>* transfers = last_update_transfers();
+      bool any_transfers = false;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        any_transfers |= !transfers[i].empty();
+      }
+      if (any_transfers && command_processor_.IsGpuTimingSequenceActive()) {
+        auto describe = [](const RenderTarget* rt) {
+          RenderTargetKey key = rt->key();
+          return fmt::format("{}{} {}x base {} pitch {}", key.is_depth ? "D" : "C",
+                             uint32_t(key.resource_format), 1u << uint32_t(key.msaa_samples),
+                             uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp));
+        };
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if (transfers[i].empty() || !depth_and_color_render_targets[i]) {
+            continue;
+          }
+          std::string entry = "transfer " + describe(depth_and_color_render_targets[i]) + " <-";
+          for (const Transfer& transfer : transfers[i]) {
+            entry += fmt::format(" {} tiles {}-{}{}", describe(transfer.source),
+                                 transfer.start_tiles, transfer.end_tiles,
+                                 transfer.host_depth_source ? " +hd" : "");
+          }
+          command_processor_.GpuTimingSequence(entry);
+        }
+      }
+      if (any_transfers) {
+        command_processor_.GpuTimingMark(VulkanCommandProcessor::GpuTimingCategory::kOther);
+        if (REXCVAR_GET(vulkan_log_render_target_transfers)) {
+          LogTransfers(depth_and_color_render_targets, transfers);
+        }
+      }
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+                                       depth_and_color_render_targets, transfers, nullptr,
+                                       last_update_transfer_cutout());
+      if (any_transfers) {
+        command_processor_.GpuTimingMark(
+            command_processor_.GpuTimingNamedCategory("transfer last destination and barriers"));
+      }
+      if (command_processor_.IsGpuTimingActive() &&
+          std::memcmp(gpu_timing_render_targets_, depth_and_color_render_targets,
+                      sizeof(gpu_timing_render_targets_))) {
+        // Close the draws to the previous render targets and name the next ones.
+        command_processor_.GpuTimingMark(VulkanCommandProcessor::GpuTimingCategory::kOther);
+        std::memcpy(gpu_timing_render_targets_, depth_and_color_render_targets,
+                    sizeof(gpu_timing_render_targets_));
+        std::string name = "draws";
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if (const RenderTarget* rt = depth_and_color_render_targets[i]) {
+            RenderTargetKey key = rt->key();
+            name += fmt::format(" {}{} {}x base {} pitch {}", key.is_depth ? "D" : "C",
+                                uint32_t(key.resource_format), 1u << uint32_t(key.msaa_samples),
+                                uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp));
+          }
+        }
+        command_processor_.GpuTimingSetDrawCategory(
+            command_processor_.GpuTimingNamedCategory(name));
+        command_processor_.GpuTimingSequence(name);
+      }
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -4546,6 +4647,53 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   return transfer_pipelines_.emplace(key, pipelines).first->second.data();
 }
 
+void VulkanRenderTargetCache::LogTransfers(RenderTarget* const* render_targets,
+                                           const std::vector<Transfer>* transfers) {
+  // Signature -> transfer count and tiles.
+  static std::map<std::string, std::pair<uint64_t, uint64_t>> stats;
+  static uint64_t log_ns = 0;
+  auto describe = [](RenderTargetKey key) {
+    return fmt::format("{}{} {}xMSAA base {} pitch {}", key.is_depth ? "D" : "C",
+                       uint32_t(key.resource_format), 1u << uint32_t(key.msaa_samples),
+                       uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp));
+  };
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!render_targets[i]) {
+      continue;
+    }
+    for (const Transfer& transfer : transfers[i]) {
+      std::string signature = describe(render_targets[i]->key()) + " <- " +
+                              describe(transfer.source->key()) +
+                              (transfer.host_depth_source ? " +host depth" : "");
+      auto& entry = stats[signature];
+      ++entry.first;
+      entry.second += transfer.end_tiles - transfer.start_tiles;
+    }
+  }
+  uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+  if (!log_ns) {
+    log_ns = now_ns;
+    return;
+  }
+  if (now_ns - log_ns < 5000000000ull) {
+    return;
+  }
+  log_ns = now_ns;
+  std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> sorted(stats.begin(),
+                                                                         stats.end());
+  std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+    return a.second.second > b.second.second;
+  });
+  REXGPU_INFO("Render target transfers in the last 5 s (by tiles):");
+  for (size_t i = 0; i < std::min(sorted.size(), size_t(12)); ++i) {
+    REXGPU_INFO("  {:>8} tiles {:>6} transfers  {}", sorted[i].second.second,
+                sorted[i].second.first, sorted[i].first);
+  }
+  stats.clear();
+}
+
 void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -4768,8 +4916,38 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   TransferAddressConstant last_host_depth_address_constant;
   TransferAddressConstant last_address_constant;
 
+  bool gpu_timing = false;
+  if (command_processor_.IsGpuTimingActive() && render_target_transfers) {
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      gpu_timing |= !render_target_transfers[i].empty();
+    }
+  }
+  auto describe_key = [](RenderTargetKey key) {
+    return fmt::format("{}{} {}x base {} pitch {}", key.is_depth ? "D" : "C",
+                       uint32_t(key.resource_format), 1u << uint32_t(key.msaa_samples),
+                       uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp));
+  };
+  if (gpu_timing) {
+    command_processor_.GpuTimingMark(
+        command_processor_.GpuTimingNamedCategory("transfer setup and host depth store"));
+  }
+  VulkanCommandProcessor::GpuTimingCategory gpu_timing_dest_category =
+      VulkanCommandProcessor::GpuTimingCategory::kTransfer;
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
+    if (gpu_timing) {
+      command_processor_.GpuTimingMark(gpu_timing_dest_category);
+      if (dest_rt && render_target_transfers && !render_target_transfers[i].empty()) {
+        std::string name = "transfer " + describe_key(dest_rt->key()) + " <-";
+        for (const Transfer& transfer : render_target_transfers[i]) {
+          name += " " + describe_key(transfer.source->key()) +
+                  (transfer.host_depth_source ? " +hd" : "");
+        }
+        gpu_timing_dest_category = command_processor_.GpuTimingNamedCategory(name);
+      } else {
+        gpu_timing_dest_category = VulkanCommandProcessor::GpuTimingCategory::kTransfer;
+      }
+    }
     if (!dest_rt) {
       continue;
     }

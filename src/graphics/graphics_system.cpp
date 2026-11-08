@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/perf/counter.h>
 #include <rex/graphics/graphics_system.h>
+#include "vblank_deadline.h"
 
 #include <algorithm>
 #include <cctype>
@@ -38,6 +40,21 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
+
+REXCVAR_DEFINE_BOOL(pg_vblank_deadline_wait, false, "GPU",
+                    "Use the Project8Recomp-style deadline wait for vblank")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vblank_after_swap, false, "GPU",
+                    "Without vsync, deliver a vblank as soon as the command processor has "
+                    "processed a swap, instead of at the next 1 ms vblank tick")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vblank_real_rate_without_vsync, false, "GPU",
+                    "Without vsync, keep delivering vblanks at the display refresh rate rather "
+                    "than every millisecond, for games that also use vblanks as a clock")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pg_vblank_stats, false, "GPU",
+                    "Log vblank-worker wakeups and thread CPU every five seconds")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
 
@@ -147,6 +164,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
   // Guest vblank timer based on the configured guest video mode.
+  swap_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -158,15 +176,67 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        const bool enable_deadline = REXCVAR_GET(pg_vblank_deadline_wait);
+        pg::DeadlineWait wait;
+        pg::VblankStats stats(REXCVAR_GET(pg_vblank_stats));
+        auto next_wake = std::chrono::steady_clock::now();
+        bool previous_deadline = false;
+        bool previous_vsync = REXCVAR_GET(vsync);
         while (vsync_worker_running_) {
+          // Only the vblank rate: presentation still follows the vsync setting.
+          const bool vsync_on =
+              REXCVAR_GET(vsync) || REXCVAR_GET(vblank_real_rate_without_vsync);
+          // Retain the SDK's 1000 Hz virtual vblank when uncapped. Only the
+          // host wait changes; scaled guest clocks keep the original path.
+          const bool deadline = enable_deadline &&
+                                chrono::Clock::guest_time_scalar() == 1.0;
+          if (deadline) {
+            const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(1.0 / (vsync_on ? refresh_rate_hz : 1000.0)));
+            auto now = std::chrono::steady_clock::now();
+            if (!previous_deadline || previous_vsync != vsync_on) next_wake = now;
+            next_wake += interval;
+            if (next_wake < now - 4 * interval) next_wake = now;
+            wait.Until(next_wake);
+          }
+          previous_deadline = deadline;
+          previous_vsync = vsync_on;
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
+              vsync_on ? vsync_interval_ticks : no_vsync_interval_ticks;
+          uint64_t delivered = 0;
+          const bool after_swap = !vsync_on && !deadline && REXCVAR_GET(vblank_after_swap);
+          if (swap_processed_.exchange(false, std::memory_order_acq_rel) && after_swap &&
+              current_time - last_frame_time >= interval_ticks / 4) {
+            // The game waits for a vblank after each swap; restart the tick from here.
             MarkVblank();
-            last_frame_time += interval_ticks;
+            last_frame_time = current_time;
+            ++delivered;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          if (deadline && vsync_on) {
+            if (current_time >= last_frame_time) {
+              const uint64_t behind = (current_time - last_frame_time) / interval_ticks;
+              delivered = std::min<uint64_t>(behind, 4);
+              for (uint64_t i = 0; i < delivered; ++i) MarkVblank();
+              // Consume the backlog even after a suspend, rather than emitting
+              // thousands of stale interrupts over subsequent wakes.
+              last_frame_time += behind * interval_ticks;
+            } else {
+              last_frame_time = current_time;
+            }
+          } else {
+            while (current_time - last_frame_time >= interval_ticks) {
+              MarkVblank();
+              last_frame_time += interval_ticks;
+              ++delivered;
+            }
+            if (after_swap) {
+              rex::thread::Wait(swap_event_.get(), false, std::chrono::milliseconds(1));
+            } else if (!deadline) {
+              rex::thread::Sleep(std::chrono::milliseconds(1));
+            }
+          }
+          stats.Wake(delivered, deadline);
         }
         return 0;
       }));
@@ -312,6 +382,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   //          interrupt_callback_, source, cpu);
 
   uint64_t args[] = {source, interrupt_callback_data_};
+  rex::perf::TimelineScope timeline_interrupt(source ? rex::perf::TimelineEvent::kCpInterrupt
+                                                     : rex::perf::TimelineEvent::kVblankInterrupt);
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
 }

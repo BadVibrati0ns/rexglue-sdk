@@ -21,6 +21,7 @@
 #include <rex/math.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/perf/counter.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -34,6 +35,8 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+REXCVAR_DEFINE_BOOL(vulkan_cache_sampler_parameters, true, "GPU/Optimizaciones",
+                    "Reuse the sampler parameters of a fetch constant while it is unchanged");
 
 namespace rex::graphics::vulkan {
 
@@ -676,6 +679,19 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
+  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  uint32_t binding_filters = uint32_t(binding.mag_filter) | (uint32_t(binding.min_filter) << 4) |
+                             (uint32_t(binding.mip_filter) << 8) |
+                             (uint32_t(binding.aniso_filter) << 12) |
+                             (uint32_t(anisotropic_override + 1) << 16);
+  SamplerParametersCacheEntry& cache_entry =
+      sampler_parameters_cache_[binding.fetch_constant & 31];
+  if (REXCVAR_GET(vulkan_cache_sampler_parameters) &&
+      cache_entry.binding_filters == binding_filters &&
+      !std::memcmp(&cache_entry.fetch, &fetch, sizeof(fetch))) {
+    return cache_entry.parameters;
+  }
+
   SamplerParameters parameters;
 
   xenos::ClampMode fetch_clamp_x, fetch_clamp_y, fetch_clamp_z;
@@ -741,7 +757,6 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
                                                  &mip_min_level, &mip_max_level);
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
-  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
       !parameters.mip_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
@@ -755,6 +770,9 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   }
   parameters.aniso_filter = aniso_filter;
 
+  cache_entry.fetch = fetch;
+  cache_entry.binding_filters = binding_filters;
+  cache_entry.parameters = parameters;
   return parameters;
 }
 
@@ -985,9 +1003,14 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
                                                    xenos::TextureFormat& format_out,
                                                    uint32_t* width_unscaled_out,
                                                    uint32_t* height_unscaled_out,
-                                                   bool* swap_source_needs_rb_swap_out) {
+                                                   bool* swap_source_needs_rb_swap_out,
+                                                   uint32_t base_address_override) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
+  if (base_address_override) {
+    // Another image laid out like the front buffer.
+    fetch.base_address = base_address_override >> 12;
+  }
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
   if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {
@@ -1867,6 +1890,14 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
     is_array = false;
   }
 
+  // Only the arguments vary for a texture, everything else the view depends on is fixed.
+  uint32_t view_arguments =
+      (host_swizzle & 0xFFF) | (uint32_t(is_signed) << 12) | (uint32_t(is_array) << 13);
+  if (last_view_ != VK_NULL_HANDLE && last_view_arguments_ == view_arguments) {
+    PROFILE_TEXTURE_CACHE_HIT();
+    return last_view_;
+  }
+
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
 
@@ -1899,8 +1930,12 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
   // Try to find an existing view.
   auto it = views_.find(view_key);
   if (it != views_.end()) {
+    PROFILE_TEXTURE_CACHE_HIT();
+    last_view_arguments_ = view_arguments;
+    last_view_ = it->second;
     return it->second;
   }
+  PROFILE_TEXTURE_CACHE_MISS();
 
   // Create a new view.
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1941,6 +1976,8 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
     return VK_NULL_HANDLE;
   }
   views_.emplace(view_key, view);
+  last_view_arguments_ = view_arguments;
+  last_view_ = view;
   return view;
 }
 

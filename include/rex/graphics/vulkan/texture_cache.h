@@ -118,7 +118,8 @@ class VulkanTextureCache final : public TextureCache {
                                  xenos::TextureFormat& format_out,
                                  uint32_t* width_unscaled_out = nullptr,
                                  uint32_t* height_unscaled_out = nullptr,
-                                 bool* swap_source_needs_rb_swap_out = nullptr);
+                                 bool* swap_source_needs_rb_swap_out = nullptr,
+                                 uint32_t base_address_override = 0);
 
   bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
                              uint32_t length_scaled_alignment_log2, uint64_t& start_scaled_out,
@@ -266,6 +267,10 @@ class VulkanTextureCache final : public TextureCache {
     Usage usage_ = Usage::kUndefined;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
+    // The last view returned by GetView and its arguments, as textures are usually bound with
+    // the same swizzle every time.
+    uint32_t last_view_arguments_ = UINT32_MAX;
+    VkImageView last_view_ = VK_NULL_HANDLE;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
@@ -374,6 +379,15 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t sampler_max_count_;
 
   xenos::AnisoFilter max_anisotropy_;
+
+  // The last parameters computed for each fetch constant, valid while the fetch constant, the
+  // binding's filter overrides and the anisotropy override are the same.
+  struct SamplerParametersCacheEntry {
+    xenos::xe_gpu_texture_fetch_t fetch;
+    uint32_t binding_filters = UINT32_MAX;
+    SamplerParameters parameters;
+  };
+  mutable SamplerParametersCacheEntry sampler_parameters_cache_[32];
 
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;

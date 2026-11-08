@@ -108,6 +108,18 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   void MarkVblank();
 
+ public:
+  // The command processor has processed a swap; with vblank_after_swap, the uncapped vblank
+  // worker delivers the next vblank now instead of at its next 1 ms wake.
+  void NotifySwapProcessed() {
+    swap_processed_.store(true, std::memory_order_release);
+    if (swap_event_) swap_event_->Set();
+  }
+
+ protected:
+  std::atomic<bool> swap_processed_{false};
+  std::unique_ptr<rex::thread::Event> swap_event_;
+
   memory::Memory* memory_ = nullptr;
   runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;

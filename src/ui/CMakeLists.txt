@@ -129,12 +129,17 @@ if(TARGET amd_fidelityfx_vk)
     target_link_libraries(rexui PRIVATE amd_fidelityfx_vk)
     set(REXUI_HAS_FIDELITYFX_RUNTIME ON)
 endif()
-if(TARGET amd_fidelityfx_dx12)
+# With both renderers the D3D12 presenter loads its FidelityFX runtime at run time instead, and
+# linking both would clash on the ffx* exports.
+if(TARGET amd_fidelityfx_dx12 AND NOT TARGET amd_fidelityfx_vk)
     target_link_libraries(rexui PRIVATE amd_fidelityfx_dx12)
     set(REXUI_HAS_FIDELITYFX_RUNTIME ON)
 endif()
 if(REXUI_HAS_FIDELITYFX_RUNTIME)
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_RUNTIME=1)
+    if(TARGET amd_fidelityfx_vk AND FFX_API_ENABLE_FRAMEGEN_PROVIDER)
+        target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_FRAMEGEN=1)
+    endif()
 endif()
 
 if(REXGLUE_USE_VULKAN)

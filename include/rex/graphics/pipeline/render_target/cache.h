@@ -171,6 +171,12 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // Whether the pixel shader of the next Update's draw may leave some pixels unwritten (kill,
+  // alpha test, alpha to coverage), so the draw can't be assumed to overwrite its render
+  // targets. Without a pixel shader there is no alpha test.
+  void SetUpdatePixelShaderMayDiscard(bool may_discard) {
+    update_pixel_shader_may_discard_ = may_discard;
+  }
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
 
@@ -492,6 +498,16 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
   }
+  // nullptr if there's no render target with the key.
+  RenderTarget* GetRenderTarget(RenderTargetKey key) const {
+    auto it = render_targets_.find(key);
+    return it != render_targets_.end() ? it->second : nullptr;
+  }
+  // Part of the render targets that the last Update's draw overwrites, not to be filled by
+  // its transfers, or nullptr.
+  const Transfer::Rectangle* last_update_transfer_cutout() const {
+    return last_update_transfer_cutout_valid_ ? &last_update_transfer_cutout_ : nullptr;
+  }
   const std::vector<Transfer>* last_update_transfers() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
@@ -554,6 +570,16 @@ class RenderTargetCache {
   uint32_t draw_resolution_scale_y_;
 
   DrawExtentEstimator draw_extent_estimator_;
+  bool update_pixel_shader_may_discard_ = true;
+  Transfer::Rectangle last_update_transfer_cutout_ = {};
+  bool last_update_transfer_cutout_valid_ = false;
+  // Render targets (bit 0 depth, 1+ color) that the current draw overwrites entirely in the
+  // range it uses.
+  uint32_t GetOverwrittenRenderTargets(uint32_t depth_and_color_rts_used_bits,
+                                       reg::RB_DEPTHCONTROL normalized_depth_control,
+                                       uint32_t normalized_color_mask, const Shader& vertex_shader,
+                                       uint32_t pitch_pixels, uint32_t height_used,
+                                       xenos::MsaaSamples msaa_samples);
 
   // For host render targets.
 

@@ -45,6 +45,10 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
                      "Soft texture cache memory limit lifetime (seconds)")
     .range(1, 3600);
 
+REXCVAR_DEFINE_BOOL(texture_cache_lookup_memo, true, "GPU/Optimizaciones",
+                    "Remember which texture each texture key resolved to, so binding it again "
+                    "skips the scaled resolve check and the texture map lookup")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -297,6 +301,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
       textures_.erase(found_texture_it);
+      ++texture_lookup_generation_;
       // `texture` is invalid now.
     }
   }
@@ -339,7 +344,10 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      scaled_resolve_pages_[i] |= add_bits;
+      if (~scaled_resolve_pages_[i] & add_bits) {
+        scaled_resolve_pages_[i] |= add_bits;
+        scaled_resolve_generation_.fetch_add(1, std::memory_order_release);
+      }
       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
     }
   }
@@ -573,8 +581,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
     }
+    shared_memory().request_tag_ = 3;
     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
+    shared_memory().request_tag_ = 0;
   }
 
   if (batched_shared_memory_request_succeeded) {
@@ -758,10 +768,40 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
+  ++texture_lookup_generation_;
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+  static_assert(sizeof(TextureKey) == 16, "The lookup memo hashes the key as two uint64_t");
+  LookupMemoEntry* memo_entry = nullptr;
+  // Read before the scaled resolve pages, so a change during the lookup makes the entry stale.
+  const uint32_t resolve_generation = scaled_resolve_generation_.load(std::memory_order_acquire);
+  if (REXCVAR_GET(texture_cache_lookup_memo)) {
+    if (!lookup_memo_) {
+      lookup_memo_ = std::make_unique<LookupMemoEntry[]>(size_t(1) << kLookupMemoSizeLog2);
+    }
+    uint64_t key_parts[2];
+    std::memcpy(key_parts, &key, sizeof(key_parts));
+    uint64_t hash = (key_parts[0] ^ (key_parts[1] * UINT64_C(0x9E3779B97F4A7C15))) *
+                    UINT64_C(0xBF58476D1CE4E5B9);
+    memo_entry = &lookup_memo_[hash >> (64 - kLookupMemoSizeLog2)];
+    if (memo_entry->texture && memo_entry->texture_generation == texture_lookup_generation_ &&
+        memo_entry->resolve_generation == resolve_generation && memo_entry->key == key) {
+      return memo_entry->texture;
+    }
+  }
+  const TextureKey requested_key = key;
+  auto remember = [&](Texture* texture) {
+    if (memo_entry) {
+      memo_entry->key = requested_key;
+      memo_entry->texture = texture;
+      memo_entry->texture_generation = texture_lookup_generation_;
+      memo_entry->resolve_generation = resolve_generation;
+    }
+    return texture;
+  };
+
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
@@ -861,7 +901,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // previously 0, now not 0, to save memory - common case in streaming.
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
-    return found_texture_it->second.get();
+    return remember(found_texture_it->second.get());
   }
 
   // Create the texture and add it to the map.
@@ -877,7 +917,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
-  return texture;
+  return remember(texture);
 }
 
 bool TextureCache::LoadTextureData(Texture& texture) {
@@ -1109,7 +1149,10 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       if (resolve_block_index == resolve_block_last && (resolve_page_last & 31) != 31) {
         resolve_keep_bits |= ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
       }
-      scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
+      if (scaled_resolve_pages_[resolve_block_index] & ~resolve_keep_bits) {
+        scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
+        scaled_resolve_generation_.fetch_add(1, std::memory_order_release);
+      }
       if (scaled_resolve_pages_[resolve_block_index] == 0) {
         scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
       }

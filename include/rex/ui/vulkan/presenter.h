@@ -12,6 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -102,12 +105,72 @@ class VulkanPresenter final : public Presenter {
     // Whether a proper barrier must be done to acquire the image.
     bool image_ever_written_previously() const { return image_ever_written_previously_; }
 
+    // FSR 3 frame generation inputs at the size of the guest output, VK_NULL_HANDLE if motion
+    // vectors are not needed. Motion vectors are R16G16_SFLOAT from the current to the previous
+    // frame in UV units, depth is R32_SFLOAT with 1 at infinity. Both can be written as storage
+    // images, and must be left in kFrameGenerationInputLayout for kFrameGenerationInputStageMask.
+    // The refresher calls SetFrameGenerationCamera after writing them, they're not used otherwise.
+    VkImage frame_generation_motion_vectors() const { return frame_generation_motion_vectors_; }
+    VkImageView frame_generation_motion_vectors_view() const {
+      return frame_generation_motion_vectors_view_;
+    }
+    VkImage frame_generation_depth() const { return frame_generation_depth_; }
+    VkImageView frame_generation_depth_view() const { return frame_generation_depth_view_; }
+    // Frame generation needs the inputs not to be larger than the display, so only the top-left
+    // part of this size is written.
+    VkExtent2D frame_generation_input_extent() const { return frame_generation_input_extent_; }
+    void SetFrameGenerationInputs(VkImage motion_vectors, VkImageView motion_vectors_view,
+                                  VkImage depth, VkImageView depth_view,
+                                  VkExtent2D input_extent) {
+      frame_generation_motion_vectors_ = motion_vectors;
+      frame_generation_motion_vectors_view_ = motion_vectors_view;
+      frame_generation_depth_ = depth;
+      frame_generation_depth_view_ = depth_view;
+      frame_generation_input_extent_ = input_extent;
+    }
+    void SetFrameGenerationCamera(float fov_vertical, float near_z) {
+      frame_generation_camera_valid_ = true;
+      frame_generation_fov_vertical_ = fov_vertical;
+      frame_generation_near_ = near_z;
+    }
+    bool frame_generation_camera_valid() const { return frame_generation_camera_valid_; }
+    // The guest output without the HUD for frame generation not to interpolate the HUD, or
+    // VK_NULL_HANDLE if not needed. Written like the guest output image, and left like it in
+    // kGuestOutputInternal*. The refresher calls SetFrameGenerationHudlessWritten after writing it.
+    VkImage frame_generation_hudless() const { return frame_generation_hudless_; }
+    VkImageView frame_generation_hudless_view() const { return frame_generation_hudless_view_; }
+    void SetFrameGenerationHudless(VkImage hudless, VkImageView hudless_view) {
+      frame_generation_hudless_ = hudless;
+      frame_generation_hudless_view_ = hudless_view;
+    }
+    void SetFrameGenerationHudlessWritten() { frame_generation_hudless_written_ = true; }
+    bool frame_generation_hudless_written() const { return frame_generation_hudless_written_; }
+    float frame_generation_fov_vertical() const { return frame_generation_fov_vertical_; }
+    float frame_generation_near() const { return frame_generation_near_; }
+
    private:
     VkImage image_;
     VkImageView image_view_;
     uint64_t image_version_;
     bool image_ever_written_previously_;
+    VkImage frame_generation_motion_vectors_ = VK_NULL_HANDLE;
+    VkImageView frame_generation_motion_vectors_view_ = VK_NULL_HANDLE;
+    VkImage frame_generation_depth_ = VK_NULL_HANDLE;
+    VkImageView frame_generation_depth_view_ = VK_NULL_HANDLE;
+    VkExtent2D frame_generation_input_extent_ = {};
+    VkImage frame_generation_hudless_ = VK_NULL_HANDLE;
+    VkImageView frame_generation_hudless_view_ = VK_NULL_HANDLE;
+    bool frame_generation_hudless_written_ = false;
+    bool frame_generation_camera_valid_ = false;
+    float frame_generation_fov_vertical_ = 0.0f;
+    float frame_generation_near_ = 0.0f;
   };
+
+  static constexpr VkPipelineStageFlags kFrameGenerationInputStageMask =
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  static constexpr VkAccessFlags kFrameGenerationInputAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  static constexpr VkImageLayout kFrameGenerationInputLayout =
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
   static std::unique_ptr<VulkanPresenter> Create(HostGpuLossCallback host_gpu_loss_callback,
                                                  const VulkanDevice* vulkan_device,
@@ -174,6 +237,24 @@ class VulkanPresenter final : public Presenter {
     VkDeviceMemory memory() const { return memory_; }
     VkImageView view() const { return view_; }
 
+    // FSR 3 frame generation motion vectors and depth of this guest output, created on demand.
+    bool EnsureFrameGenerationInputs();
+    VkImage frame_generation_motion_vectors() const { return frame_generation_motion_vectors_; }
+    VkImageView frame_generation_motion_vectors_view() const {
+      return frame_generation_motion_vectors_view_;
+    }
+    VkImage frame_generation_depth() const { return frame_generation_depth_; }
+    VkImageView frame_generation_depth_view() const { return frame_generation_depth_view_; }
+    VkImage frame_generation_hudless() const { return frame_generation_hudless_; }
+    VkImageView frame_generation_hudless_view() const { return frame_generation_hudless_view_; }
+    // Whether the last refresh has written the guest output without the HUD.
+    bool frame_generation_hudless_valid = false;
+    // Whether the last refresh has written the inputs, and the camera it has written them for.
+    bool frame_generation_camera_valid = false;
+    VkExtent2D frame_generation_input_extent = {};
+    float frame_generation_fov_vertical = 0.0f;
+    float frame_generation_near = 0.0f;
+
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
                      const uint32_t height)
@@ -190,6 +271,16 @@ class VulkanPresenter final : public Presenter {
     VkImage image_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
+    VkImage frame_generation_motion_vectors_ = VK_NULL_HANDLE;
+    VkDeviceMemory frame_generation_motion_vectors_memory_ = VK_NULL_HANDLE;
+    VkImageView frame_generation_motion_vectors_view_ = VK_NULL_HANDLE;
+    VkImage frame_generation_depth_ = VK_NULL_HANDLE;
+    VkDeviceMemory frame_generation_depth_memory_ = VK_NULL_HANDLE;
+    VkImageView frame_generation_depth_view_ = VK_NULL_HANDLE;
+    VkImage frame_generation_hudless_ = VK_NULL_HANDLE;
+    VkDeviceMemory frame_generation_hudless_memory_ = VK_NULL_HANDLE;
+    VkImageView frame_generation_hudless_view_ = VK_NULL_HANDLE;
+    bool frame_generation_inputs_failed_ = false;
   };
 
   struct GuestOutputImageInstance {
@@ -230,7 +321,7 @@ class VulkanPresenter final : public Presenter {
 
   enum GuestOutputPaintPipelineLayoutIndex : size_t {
     kGuestOutputPaintPipelineLayoutIndexBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
     kGuestOutputPaintPipelineLayoutIndexCasSharpen,
     kGuestOutputPaintPipelineLayoutIndexCasResample,
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
@@ -246,7 +337,7 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintPipelineLayoutIndexBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
         return kGuestOutputPaintPipelineLayoutIndexCasSharpen;
@@ -353,7 +444,7 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& ui_surface_unusable_out, VkSwapchainCreateInfoKHR* create_info_out = nullptr);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -361,6 +452,8 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR PrepareForSwapchainRetirement();
     // May be called from the destructor of the presenter.
     void DestroySwapchainAndVulkanSurface();
+    // Destroys a swapchain returned by PrepareForSwapchainRetirement.
+    void DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain);
 
     // Connection-indepedent.
 
@@ -416,6 +509,16 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+    // FidelityFX frame generation swapchain context (ffxContext) owning `swapchain` when not
+    // null, with its replacements of the swapchain functions.
+    void* frame_generation_swapchain_context = nullptr;
+    PFN_vkGetSwapchainImagesKHR frame_generation_get_swapchain_images = nullptr;
+    PFN_vkAcquireNextImageKHR frame_generation_acquire_next_image = nullptr;
+    PFN_vkQueuePresentKHR frame_generation_queue_present = nullptr;
+    uint64_t (*frame_generation_get_present_count)(VkSwapchainKHR) = nullptr;
+#endif
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
@@ -443,6 +546,24 @@ class VulkanPresenter final : public Presenter {
                                 uint32_t output_width, uint32_t output_height,
                                 const GuestOutputPaintConfig& config);
   void DestroyTemporalUpscalerContext();
+#endif
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  // Replaces paint_context_.swapchain with a frame generation swapchain created with the same
+  // parameters. On failure, the original swapchain is kept.
+  bool ReplaceSwapchainForFrameGeneration(const VkSwapchainCreateInfoKHR& create_info);
+  void DestroyFrameGenerationContext();
+  // Creates the frame generation context and its inputs for the current swapchain if needed,
+  // accepting motion vectors and depth of up to the render extent.
+  bool EnsureFrameGenerationContext(VkExtent2D render_extent);
+  // Configures frame generation for the frame being painted and records its preparation.
+  void PrepareFrameGeneration(VkCommandBuffer command_buffer,
+                              const GuestOutputImage* guest_output_image,
+                              uint64_t paint_submission_index);
+  // Paints the guest output without the HUD like the guest output was painted to the swapchain,
+  // returns the image or VK_NULL_HANDLE if not available.
+  VkImage PaintFrameGenerationHudless(VkCommandBuffer command_buffer,
+                                      const GuestOutputImage* guest_output_image,
+                                      uint64_t paint_submission_index);
 #endif
 
   const VulkanDevice* vulkan_device_;
@@ -488,6 +609,64 @@ class VulkanPresenter final : public Presenter {
   uint32_t temporal_upscaler_max_output_width_ = 0;
   uint32_t temporal_upscaler_max_output_height_ = 0;
   bool temporal_upscaler_provider_logged_ = false;
+#endif
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  void* frame_generation_context_ = nullptr;
+  VkExtent2D frame_generation_extent_ = {};
+  VkExtent2D frame_generation_max_render_extent_ = {};
+  // The final guest output paint effect of the current paint, to paint the guest output without
+  // the HUD the same way (only when there's a single effect).
+  struct FrameGenerationHudlessPaint {
+    bool valid = false;
+    VkPipeline pipeline;
+    VkPipelineLayout pipeline_layout;
+    VkViewport viewport;
+    VkRect2D scissor;
+    GuestOutputPaintRectangleConstants rect_constants;
+    uint32_t effect_constants_size;
+    alignas(16) uint8_t effect_constants[128];
+  };
+  FrameGenerationHudlessPaint frame_generation_hudless_paint_;
+  // Frame generation reads the guest output without the HUD painted to the display when it
+  // interpolates later, so there are multiple of them.
+  static constexpr uint32_t kFrameGenerationHudlessCount = 6;
+  VkRenderPass frame_generation_hudless_render_pass_ = VK_NULL_HANDLE;
+  VkDescriptorPool frame_generation_hudless_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kFrameGenerationHudlessCount>
+      frame_generation_hudless_descriptor_sets_{};
+  std::array<VkImage, kFrameGenerationHudlessCount> frame_generation_hudless_images_{};
+  std::array<VkDeviceMemory, kFrameGenerationHudlessCount> frame_generation_hudless_memory_{};
+  std::array<VkImageView, kFrameGenerationHudlessCount> frame_generation_hudless_views_{};
+  std::array<VkFramebuffer, kFrameGenerationHudlessCount> frame_generation_hudless_framebuffers_{};
+  std::array<uint64_t, kFrameGenerationHudlessCount> frame_generation_hudless_submissions_{};
+  uint32_t frame_generation_hudless_next_ = 0;
+  VkFormat frame_generation_format_ = VK_FORMAT_UNDEFINED;
+  // Depth and motion vectors given to frame generation, at the swapchain size.
+  VkImage frame_generation_depth_ = VK_NULL_HANDLE;
+  VkDeviceMemory frame_generation_depth_memory_ = VK_NULL_HANDLE;
+  VkImage frame_generation_motion_vectors_ = VK_NULL_HANDLE;
+  VkDeviceMemory frame_generation_motion_vectors_memory_ = VK_NULL_HANDLE;
+  bool frame_generation_inputs_initialized_ = false;
+  uint64_t frame_generation_frame_id_ = 0;
+  uint64_t frame_generation_last_paint_ns_ = 0;
+  uint64_t frame_generation_log_ns_ = 0;
+  uint64_t frame_generation_log_frame_id_ = 0;
+  uint64_t frame_generation_log_present_count_ = 0;
+  // For GetFrameGenerationStats, over a shorter window than the log.
+  uint64_t frame_generation_stats_ns_ = 0;
+  uint64_t frame_generation_stats_frame_id_ = 0;
+  uint64_t frame_generation_stats_present_count_ = 0;
+  uint64_t frame_generation_log_refresh_ = 0;
+  // Guest output refreshes, to give frame generation only new frames.
+  std::atomic<uint64_t> frame_generation_guest_refreshes_{0};
+  // Swapchain width in the low 32 bits and height in the high ones, for the refresher.
+  std::atomic<uint64_t> frame_generation_display_extent_{0};
+  uint64_t frame_generation_painted_refresh_ = UINT64_MAX;
+  // The guest waits for its previous frame to be painted, so it doesn't render frames that are
+  // never displayed and take the GPU from frame generation.
+  std::mutex frame_generation_paint_mutex_;
+  std::condition_variable frame_generation_paint_cv_;
+  std::atomic<uint64_t> frame_generation_painted_refreshes_{0};
 #endif
 };
 

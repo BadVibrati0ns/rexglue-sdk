@@ -54,10 +54,14 @@ class VulkanSharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  bool UploadRangesAtSubmissionStart(
+      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
+  bool CopyRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges,
+                  DeferredCommandBuffer& command_buffer);
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;

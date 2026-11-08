@@ -101,6 +101,8 @@ namespace rex::graphics {
 
 class PrimitiveProcessor {
  public:
+  // Time stamp counter ticks spent requesting index buffers in the shared memory.
+  uint64_t index_request_ticks_ = 0;
   enum ProcessedIndexBufferType {
     // Auto-indexed on the host.
     kNone,

@@ -605,6 +605,21 @@ class TextureCache {
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
 
+  // Results of FindOrCreateTexture by the key it was called with. An entry is stale when a
+  // texture has been destroyed or the scaled resolve pages have changed since it was stored.
+  struct LookupMemoEntry {
+    TextureKey key;
+    Texture* texture = nullptr;
+    uint32_t texture_generation = 0;
+    uint32_t resolve_generation = 0;
+  };
+  static constexpr uint32_t kLookupMemoSizeLog2 = 10;
+  std::unique_ptr<LookupMemoEntry[]> lookup_memo_;
+  // Incremented when a texture is destroyed.
+  uint32_t texture_lookup_generation_ = 1;
+  // Incremented when scaled resolve pages change, possibly from another thread.
+  std::atomic<uint32_t> scaled_resolve_generation_{1};
+
   uint64_t textures_total_host_memory_usage_ = 0;
 
   Texture* texture_used_first_ = nullptr;

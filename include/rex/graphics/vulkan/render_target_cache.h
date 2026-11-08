@@ -115,6 +115,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
+  // For using depth outside the render target cache: the key of the single-sampled depth render
+  // target of the last update with its pitch, or false if there's none.
+  bool GetLastUpdateDepthRenderTarget(uint32_t& key_out, uint32_t& pitch_tiles_at_32bpp_out) const;
+  // Transitions the depth render target with the key for sampling in compute shaders and returns
+  // its depth view, or VK_NULL_HANDLE if there's no such render target.
+  VkImageView UseDepthRenderTargetForComputeSampling(uint32_t key);
   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,
@@ -280,6 +286,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   const RenderTarget* const*
       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
+  // Render targets the GPU timing draw category was named after.
+  RenderTarget* gpu_timing_render_targets_[1 + xenos::kMaxColorRenderTargets] = {};
 
   // For host render targets.
 
@@ -794,6 +802,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
   // bound checks.
+  void LogTransfers(RenderTarget* const* render_targets,
+                    const std::vector<Transfer>* transfers);
   void PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,

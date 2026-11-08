@@ -1,4 +1,7 @@
 #pragma once
+
+// CAS and FSR 1 (EASU + RCAS) use precompiled shaders and need no FidelityFX SDK.
+#define REX_HAS_FFX_SPATIAL 1
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -212,7 +215,7 @@ class Presenter {
    public:
     enum class Effect {
       kBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       kCas,
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
       // Sharpening otherwise.
@@ -228,7 +231,7 @@ class Presenter {
 #endif
     };
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
     enum class FsrQualityMode {
       // Keep current behavior and use the guest output size as-is.
       kAuto,
@@ -260,7 +263,7 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+#endif  // defined(REX_HAS_FFX_SPATIAL)
 
     // In the sharpness setters, min / max with a constant as the first argument
     // also drops NaNs.
@@ -273,7 +276,7 @@ class Presenter {
     Effect GetEffect() const { return effect_; }
     void SetEffect(Effect new_effect) { effect_ = new_effect; }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
     float GetCasAdditionalSharpness() const { return cas_additional_sharpness_; }
     void SetCasAdditionalSharpness(float new_cas_additional_sharpness) {
       cas_additional_sharpness_ =
@@ -299,7 +302,7 @@ class Presenter {
     void SetFsrQualityMode(FsrQualityMode new_fsr_quality_mode) {
       fsr_quality_mode_ = new_fsr_quality_mode;
     }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+#endif  // defined(REX_HAS_FFX_SPATIAL)
 
     // Very tiny effect, but highly noticeable, for instance, on the sky in the
     // 4D5307E6 main menu (prominently in Custom Games, especially with FSR -
@@ -314,7 +317,7 @@ class Presenter {
     // original front buffer as possible.
     bool allow_overscan_cutoff_ = false;
     Effect effect_ = Effect::kBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
@@ -427,7 +430,7 @@ class Presenter {
   enum class GuestOutputPaintEffect {
     kBilinear,
     kBilinearDither,
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
     kCasSharpen,
     kCasSharpenDither,
     kCasResample,
@@ -446,7 +449,7 @@ class Presenter {
       // Dithering is never performed in intermediate passes because it may be
       // interpreted as features by the subsequent passes.
       case GuestOutputPaintEffect::kBilinearDither:
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       case GuestOutputPaintEffect::kCasSharpenDither:
       case GuestOutputPaintEffect::kCasResampleDither:
       case GuestOutputPaintEffect::kFsrRcasDither:
@@ -461,7 +464,7 @@ class Presenter {
 
   static constexpr bool CanGuestOutputPaintEffectBeFinal(GuestOutputPaintEffect effect) {
     switch (effect) {
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       case GuestOutputPaintEffect::kFsrEasu:
         return false;
 #endif
@@ -470,7 +473,7 @@ class Presenter {
     };
   }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   // The longest path is kFsrMaxUpscalingPassesMax + optionally RCAS +
   // optionally bilinear, when upscaling by more than
   // 2^kFsrMaxUpscalingPassesMax along any direction.
@@ -548,7 +551,7 @@ class Presenter {
     }
   };
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
   static constexpr float CalculateCasPostSetupSharpness(float sharpness) {
     // CasSetup const1.x.
     return -1.0f / (8.0f - 3.0f * sharpness);
@@ -615,7 +618,7 @@ class Presenter {
       sharpness_post_setup = CalculatePostSetupSharpness(config.GetFsrSharpnessReduction());
     }
   };
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+#endif  // defined(REX_HAS_FFX_SPATIAL)
 
   explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
       : host_gpu_loss_callback_(host_gpu_loss_callback) {}

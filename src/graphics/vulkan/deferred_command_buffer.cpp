@@ -181,6 +181,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                              args.first_index, args.vertex_offset, args.first_instance);
       } break;
 
+      case Command::kVkWriteTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
+        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool, args.query);
+      } break;
+
       case Command::kVkEndQuery: {
         auto& args = *reinterpret_cast<const ArgsVkEndQuery*>(stream);
         dfn.vkCmdEndQuery(command_buffer, args.query_pool, args.query);

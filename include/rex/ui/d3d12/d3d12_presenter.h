@@ -262,7 +262,7 @@ class D3D12Presenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_SPATIAL)
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                      uint32_t output_width, uint32_t output_height);
   bool DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command_list,
@@ -312,7 +312,7 @@ class D3D12Presenter final : public Presenter {
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_SPATIAL)
   void* temporal_upscaler_context_ = nullptr;
   uint32_t temporal_upscaler_max_render_width_ = 0;
   uint32_t temporal_upscaler_max_render_height_ = 0;

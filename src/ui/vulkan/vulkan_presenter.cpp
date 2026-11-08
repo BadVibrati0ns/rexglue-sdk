@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/ui/frame_generation_stats.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -31,6 +33,9 @@
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
+#endif
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+#include <ffx_api/ffx_framegeneration.h>
 #endif
 
 #if REX_PLATFORM_ANDROID
@@ -58,8 +63,74 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation, false, "UI/Presenter",
+                    "AMD FSR 3 frame generation: present an interpolated frame between every two "
+                    "rendered frames")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_vsync, true, "UI/Presenter",
+                    "With FSR 3 frame generation, present with vertical sync: its pacing places "
+                    "each interpolated frame halfway between two rendered ones, which tearing "
+                    "and a base frame rate above half the refresh rate make uneven")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_active, true, "UI/Presenter",
+                    "With the FSR 3 frame generation swapchain created, present the interpolated "
+                    "frames; off presents only the rendered frames, without a restart");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_only_generated, false, "UI/Presenter",
+                    "Debug: present only the interpolated frames of FSR 3 frame generation");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_debug_view, false, "UI/Presenter",
+                    "Debug: draw the FSR 3 frame generation debug view in the generated frames");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_debug_lines, false, "UI/Presenter",
+                    "Debug: draw the FSR 3 frame generation tear and pacing lines");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_async, true, "UI/Presenter",
+                    "Run FSR 3 frame generation on an asynchronous compute queue");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_limit_guest, true, "UI/Presenter",
+                    "With FSR 3 frame generation, make the game wait for its previous frame to be "
+                    "displayed instead of rendering frames that are never shown");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_motion_vectors, true, "UI/Presenter",
+                    "With FSR 3 frame generation, give it the camera motion vectors and depth of "
+                    "the game when the game configuration says where the camera is, instead of "
+                    "relying only on the optical flow of the frames");
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_hudless, false, "UI/Presenter",
+                    "With FSR 3 frame generation, give it the game image without the HUD when "
+                    "the game provides it so the HUD is not interpolated. Off by default: it "
+                    "doesn't match the presented image outside the HUD, so FSR 3 takes the whole "
+                    "frame as HUD and every generated frame repeats the next rendered one");
+REXCVAR_DEFINE_INT32(fsr3_frame_generation_buffers, 3, "UI/Presenter",
+                     "Backbuffers of the FSR 3 frame generation swapchain (more than 3 needs "
+                     "composition on the present queue)")
+    .range(2, 6)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fsr3_frame_generation_compose_on_present_queue, false, "UI/Presenter",
+                    "Compose FSR 3 generated frames on the present queue instead of the game queue")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+
 namespace rex {
 namespace ui {
+
+namespace {
+std::atomic<uint64_t> frame_generation_stats_paint_ns{0};
+std::atomic<bool> frame_generation_stats_hudless{false};
+std::atomic<double> frame_generation_stats_painted_fps{0.0};
+std::atomic<double> frame_generation_stats_presented_fps{0.0};
+}  // namespace
+
+FrameGenerationStats GetFrameGenerationStats() {
+  FrameGenerationStats stats;
+  uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+  uint64_t paint_ns = frame_generation_stats_paint_ns.load(std::memory_order_relaxed);
+  stats.available = paint_ns && now_ns - paint_ns < 1000000000ull;
+  if (stats.available) {
+    stats.hudless = frame_generation_stats_hudless.load(std::memory_order_relaxed);
+    stats.painted_fps = frame_generation_stats_painted_fps.load(std::memory_order_relaxed);
+    stats.presented_fps = frame_generation_stats_presented_fps.load(std::memory_order_relaxed);
+  }
+  return stats;
+}
+
 namespace vulkan {
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -102,6 +173,24 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
   return nullptr;
 }
 
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+// The frame generation swapchain submits to the game queue from its own threads.
+std::atomic<const VulkanDevice*> g_frame_generation_device{nullptr};
+
+VkResult FrameGenerationGameQueueSubmit(uint32_t submit_count, const VkSubmitInfo* submits,
+                                        VkFence fence) {
+  const VulkanDevice* vulkan_device = g_frame_generation_device.load(std::memory_order_relaxed);
+  const VulkanDevice::Queue::Acquisition queue_acquisition =
+      vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+  return vulkan_device->functions().vkQueueSubmit(queue_acquisition.queue(), submit_count,
+                                                  submits, fence);
+}
+
+ffxReturnCode_t FrameGenerationDispatch(ffxDispatchDescFrameGeneration* params, void* context) {
+  return ffxDispatch(reinterpret_cast<ffxContext*>(context), &params->header);
+}
+#endif
+
 }  // namespace
 #endif  // defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 
@@ -109,7 +198,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
 namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_bilinear_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_bilinear_ps.h"
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_sharpen_dither_ps.h"
@@ -199,6 +288,9 @@ VulkanPresenter::~VulkanPresenter() {
   // vkQueuePresentKHR execution (or between the vkQueueSubmit semaphore signal
   // and the vkQueuePresentKHR semaphore wait).
   // This will await completion of all paint submissions also.
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  DestroyFrameGenerationContext();
+#endif
   paint_context_.DestroySwapchainAndVulkanSurface();
 
   // Await completion of the usage of everything before destroying anything
@@ -274,7 +366,7 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
     ffxCreateContextDescUpscale create_desc = {};
     create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create_desc.header.pNext = nullptr;
-    create_desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    create_desc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     create_desc.maxRenderSize.width = render_width;
     create_desc.maxRenderSize.height = render_height;
     create_desc.maxUpscaleSize.width = output_width;
@@ -414,6 +506,578 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
     return false;
   }
   return true;
+}
+#endif
+
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+bool VulkanPresenter::ReplaceSwapchainForFrameGeneration(
+    const VkSwapchainCreateInfoKHR& create_info) {
+  // The swapchain gets presented, acquired and composed on queues of its own, all in the
+  // graphics family so no ownership transfers are needed.
+  const uint32_t queue_family = vulkan_device_->queue_family_graphics_compute();
+  if (create_info.imageSharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+      paint_context_.present_queue_family != queue_family ||
+      vulkan_device_->queue_families()[queue_family].queues.size() < 4) {
+    REXLOG_WARN(
+        "VulkanPresenter: FSR 3 frame generation needs 4 graphics queues that can present; "
+        "using the normal swapchain");
+    return false;
+  }
+  auto get_queue = [&](uint32_t index) {
+    VkQueueInfoFFXAPI queue_info = {};
+    queue_info.queue = vulkan_device_->AcquireQueue(queue_family, index).queue();
+    queue_info.familyIndex = queue_family;
+    return queue_info;
+  };
+  g_frame_generation_device.store(vulkan_device_, std::memory_order_relaxed);
+
+  ffxCreateContextDescFrameGenerationSwapChainVK create_desc = {};
+  create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
+  create_desc.physicalDevice = vulkan_device_->physical_device();
+  create_desc.device = vulkan_device_->device();
+  VkSwapchainKHR swapchain = paint_context_.swapchain;
+  create_desc.swapchain = &swapchain;
+  create_desc.createInfo = create_info;
+  create_desc.createInfo.oldSwapchain = VK_NULL_HANDLE;
+  // Presenting blocks until the backbuffer painted that many frames before has been presented
+  // along with its interpolated frame, so give painting more slack than without generation.
+  create_desc.createInfo.minImageCount =
+      std::max(create_info.minImageCount, uint32_t(REXCVAR_GET(fsr3_frame_generation_buffers)));
+  create_desc.gameQueue = get_queue(0);
+  create_desc.gameQueue.submitFunc = FrameGenerationGameQueueSubmit;
+  create_desc.presentQueue = get_queue(1);
+  create_desc.asyncComputeQueue = get_queue(2);
+  create_desc.imageAcquireQueue = get_queue(3);
+  // Interpolate on a compute-only queue when there is one, so the interpolation of a frame
+  // doesn't wait behind the rendering of the next one on the graphics queue.
+  const std::vector<VulkanDevice::QueueFamily>& queue_families = vulkan_device_->queue_families();
+  for (uint32_t i = 0; i < uint32_t(queue_families.size()); ++i) {
+    if ((queue_families[i].queue_flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+            VK_QUEUE_COMPUTE_BIT &&
+        !queue_families[i].queues.empty()) {
+      create_desc.asyncComputeQueue.queue = vulkan_device_->AcquireQueue(i, 0).queue();
+      create_desc.asyncComputeQueue.familyIndex = i;
+      break;
+    }
+  }
+  // Compose on the game queue: a graphics present queue shares the hardware queue with the
+  // game, so composing there waits behind the guest's next submission.
+  ffxCreateContextDescFrameGenerationSwapChainModeVK mode_desc = {};
+  mode_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_MODE_VK;
+  mode_desc.composeOnPresentQueue = REXCVAR_GET(fsr3_frame_generation_compose_on_present_queue);
+  create_desc.header.pNext = &mode_desc.header;
+  ffxContext context = nullptr;
+  ffxReturnCode_t result = ffxCreateContext(&context, &create_desc.header, nullptr);
+  // The original swapchain is destroyed even if the replacement fails.
+  paint_context_.swapchain = result == FFX_API_RETURN_OK ? swapchain : VK_NULL_HANDLE;
+  if (result != FFX_API_RETURN_OK) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the FSR 3 frame generation swapchain ({})",
+                 uint32_t(result));
+    return false;
+  }
+
+  ffxQueryDescSwapchainReplacementFunctionsVK functions = {};
+  functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
+  ffxQuery(&context, &functions.header);
+  paint_context_.frame_generation_swapchain_context = context;
+  paint_context_.frame_generation_get_swapchain_images = functions.pOutGetSwapchainImagesKHR;
+  paint_context_.frame_generation_acquire_next_image = functions.pOutAcquireNextImageKHR;
+  paint_context_.frame_generation_queue_present = functions.pOutQueuePresentKHR;
+  paint_context_.frame_generation_get_present_count = functions.pOutGetLastPresentCountFFXAPI;
+  REXLOG_INFO("VulkanPresenter: FSR 3 frame generation swapchain created");
+  return true;
+}
+
+void VulkanPresenter::DestroyFrameGenerationContext() {
+  if (!frame_generation_context_ && frame_generation_depth_ == VK_NULL_HANDLE &&
+      frame_generation_motion_vectors_ == VK_NULL_HANDLE) {
+    return;
+  }
+  paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+  if (frame_generation_context_) {
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&frame_generation_context_), nullptr);
+    frame_generation_context_ = nullptr;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, frame_generation_depth_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, frame_generation_depth_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, frame_generation_motion_vectors_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, frame_generation_motion_vectors_memory_);
+  for (uint32_t i = 0; i < kFrameGenerationHudlessCount; ++i) {
+    util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
+                               frame_generation_hudless_framebuffers_[i]);
+    util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, frame_generation_hudless_views_[i]);
+    util::DestroyAndNullHandle(dfn.vkDestroyImage, device, frame_generation_hudless_images_[i]);
+    util::DestroyAndNullHandle(dfn.vkFreeMemory, device, frame_generation_hudless_memory_[i]);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                             frame_generation_hudless_descriptor_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                             frame_generation_hudless_render_pass_);
+  frame_generation_inputs_initialized_ = false;
+  frame_generation_extent_ = {};
+  frame_generation_max_render_extent_ = {};
+  frame_generation_format_ = VK_FORMAT_UNDEFINED;
+}
+
+bool VulkanPresenter::EnsureFrameGenerationContext(VkExtent2D render_extent) {
+  const VkExtent2D extent = paint_context_.swapchain_extent;
+  const VkFormat format = paint_context_.swapchain_render_pass_format;
+  if (frame_generation_context_ && frame_generation_extent_.width == extent.width &&
+      frame_generation_extent_.height == extent.height && frame_generation_format_ == format &&
+      frame_generation_max_render_extent_.width >= render_extent.width &&
+      frame_generation_max_render_extent_.height >= render_extent.height) {
+    return true;
+  }
+  render_extent.width = std::max(
+      std::max(render_extent.width, extent.width), frame_generation_max_render_extent_.width);
+  render_extent.height = std::max(
+      std::max(render_extent.height, extent.height), frame_generation_max_render_extent_.height);
+  DestroyFrameGenerationContext();
+
+  ffxCreateBackendVKDesc backend_desc = {};
+  backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+  backend_desc.vkDevice = vulkan_device_->device();
+  backend_desc.vkPhysicalDevice = vulkan_device_->physical_device();
+  PFN_vkGetDeviceProcAddr vk_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+      vulkan_device_->vulkan_instance()->functions().vkGetInstanceProcAddr(
+          vulkan_device_->vulkan_instance()->instance(), "vkGetDeviceProcAddr"));
+  if (!vk_device_proc_addr) {
+    return false;
+  }
+  g_ffx_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
+  backend_desc.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
+
+  ffxCreateContextDescFrameGeneration create_desc = {};
+  create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+  create_desc.header.pNext = &backend_desc.header;
+  // The motion vectors and depth are either of the guest output or zero at the display size.
+  // Xbox 360 games commonly use an infinite far plane with depth increasing with distance.
+  create_desc.flags =
+      FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
+  create_desc.displaySize.width = extent.width;
+  create_desc.displaySize.height = extent.height;
+  create_desc.maxRenderSize.width = render_extent.width;
+  create_desc.maxRenderSize.height = render_extent.height;
+  create_desc.backBufferFormat = ffxApiGetSurfaceFormatVK(format);
+  if (ffxCreateContext(reinterpret_cast<ffxContext*>(&frame_generation_context_),
+                       &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the FSR 3 frame generation context");
+    frame_generation_context_ = nullptr;
+    return false;
+  }
+
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.extent = {extent.width, extent.height, 1};
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  image_create_info.format = VK_FORMAT_R32_SFLOAT;
+  bool images_created = util::CreateDedicatedAllocationImage(
+      vulkan_device_, image_create_info, util::MemoryPurpose::kDeviceLocal,
+      frame_generation_depth_, frame_generation_depth_memory_);
+  image_create_info.format = VK_FORMAT_R16G16_SFLOAT;
+  images_created = images_created &&
+                   util::CreateDedicatedAllocationImage(
+                       vulkan_device_, image_create_info, util::MemoryPurpose::kDeviceLocal,
+                       frame_generation_motion_vectors_, frame_generation_motion_vectors_memory_);
+  if (!images_created) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the FSR 3 frame generation inputs");
+    DestroyFrameGenerationContext();
+    return false;
+  }
+  frame_generation_extent_ = extent;
+  frame_generation_max_render_extent_ = render_extent;
+  frame_generation_format_ = format;
+  frame_generation_frame_id_ = 0;
+  frame_generation_last_paint_ns_ = 0;
+  frame_generation_log_ns_ = 0;
+  frame_generation_stats_ns_ = 0;
+  return true;
+}
+
+void VulkanPresenter::PrepareFrameGeneration(VkCommandBuffer command_buffer,
+                                             const GuestOutputImage* guest_output_image,
+                                             uint64_t paint_submission_index) {
+  frame_generation_display_extent_.store(
+      uint64_t(paint_context_.swapchain_extent.width) |
+          (uint64_t(paint_context_.swapchain_extent.height) << 32),
+      std::memory_order_relaxed);
+  // Inputs larger than the display make the GPU device lost.
+  const bool use_guest_inputs =
+      guest_output_image && guest_output_image->frame_generation_camera_valid &&
+      REXCVAR_GET(fsr3_frame_generation_motion_vectors) &&
+      guest_output_image->frame_generation_input_extent.width <=
+          paint_context_.swapchain_extent.width &&
+      guest_output_image->frame_generation_input_extent.height <=
+          paint_context_.swapchain_extent.height;
+  if (!EnsureFrameGenerationContext(use_guest_inputs
+                                        ? guest_output_image->frame_generation_input_extent
+                                        : paint_context_.swapchain_extent)) {
+    return;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  if (!frame_generation_inputs_initialized_) {
+    // No motion vectors yet: the interpolation relies on the optical flow of the frames.
+    VkImageMemoryBarrier barriers[2] = {};
+    for (VkImageMemoryBarrier& barrier : barriers) {
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    barriers[0].image = frame_generation_depth_;
+    barriers[1].image = frame_generation_motion_vectors_;
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             barriers);
+    VkClearColorValue clear_value = {};
+    clear_value.float32[0] = 1.0f;
+    dfn.vkCmdClearColorImage(command_buffer, frame_generation_depth_,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_value, 1,
+                             &barriers[0].subresourceRange);
+    clear_value.float32[0] = 0.0f;
+    dfn.vkCmdClearColorImage(command_buffer, frame_generation_motion_vectors_,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_value, 1,
+                             &barriers[1].subresourceRange);
+    for (VkImageMemoryBarrier& barrier : barriers) {
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             barriers);
+    frame_generation_inputs_initialized_ = true;
+  }
+
+  uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+  float frame_time_ms = frame_generation_last_paint_ns_
+                            ? float(double(now_ns - frame_generation_last_paint_ns_) / 1.0e6)
+                            : 16.667f;
+  frame_generation_last_paint_ns_ = now_ns;
+  const uint64_t frame_id = frame_generation_frame_id_++;
+  if (paint_context_.frame_generation_get_present_count &&
+      now_ns - frame_generation_log_ns_ >= 5000000000ull) {
+    uint64_t present_count = paint_context_.frame_generation_get_present_count(
+        paint_context_.swapchain);
+    if (frame_generation_log_ns_) {
+      double seconds = double(now_ns - frame_generation_log_ns_) / 1.0e9;
+      REXLOG_INFO("VulkanPresenter: FSR 3 frame generation: {:.1f} frames/s painted, {:.1f} "
+                  "presented, {:.1f} guest outputs",
+                  double(frame_id - frame_generation_log_frame_id_) / seconds,
+                  double(present_count - frame_generation_log_present_count_) / seconds,
+                  double(frame_generation_painted_refresh_ - frame_generation_log_refresh_) /
+                      seconds);
+    }
+    frame_generation_log_refresh_ = frame_generation_painted_refresh_;
+    frame_generation_log_ns_ = now_ns;
+    frame_generation_log_frame_id_ = frame_id;
+    frame_generation_log_present_count_ = present_count;
+  }
+  if (paint_context_.frame_generation_get_present_count &&
+      now_ns - frame_generation_stats_ns_ >= 500000000ull) {
+    uint64_t present_count = paint_context_.frame_generation_get_present_count(
+        paint_context_.swapchain);
+    if (frame_generation_stats_ns_) {
+      double seconds = double(now_ns - frame_generation_stats_ns_) / 1.0e9;
+      frame_generation_stats_painted_fps.store(
+          double(frame_id - frame_generation_stats_frame_id_) / seconds,
+          std::memory_order_relaxed);
+      frame_generation_stats_presented_fps.store(
+          double(present_count - frame_generation_stats_present_count_) / seconds,
+          std::memory_order_relaxed);
+    }
+    frame_generation_stats_ns_ = now_ns;
+    frame_generation_stats_frame_id_ = frame_id;
+    frame_generation_stats_present_count_ = present_count;
+  }
+  frame_generation_stats_paint_ns.store(now_ns, std::memory_order_relaxed);
+  const VkExtent2D extent = frame_generation_extent_;
+  ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
+
+  ffxConfigureDescFrameGeneration configure_desc = {};
+  configure_desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+  configure_desc.swapChain = paint_context_.swapchain;
+  configure_desc.frameGenerationCallback = FrameGenerationDispatch;
+  configure_desc.frameGenerationCallbackUserContext = context;
+  configure_desc.frameGenerationEnabled = REXCVAR_GET(fsr3_frame_generation_active);
+  configure_desc.allowAsyncWorkloads = REXCVAR_GET(fsr3_frame_generation_async);
+  configure_desc.generationRect = {0, 0, int32_t(extent.width), int32_t(extent.height)};
+  configure_desc.frameID = frame_id;
+  configure_desc.onlyPresentGenerated = REXCVAR_GET(fsr3_frame_generation_only_generated);
+  uint32_t debug_flags = 0;
+  if (REXCVAR_GET(fsr3_frame_generation_debug_view)) {
+    debug_flags |= FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW;
+  }
+  if (REXCVAR_GET(fsr3_frame_generation_debug_lines)) {
+    debug_flags |= FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
+                   FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES;
+  }
+  configure_desc.flags = debug_flags;
+  VkImage hudless_image =
+      PaintFrameGenerationHudless(command_buffer, guest_output_image, paint_submission_index);
+  frame_generation_stats_hudless.store(hudless_image != VK_NULL_HANDLE, std::memory_order_relaxed);
+  if (hudless_image != VK_NULL_HANDLE) {
+    VkImageCreateInfo hudless_create_info = {};
+    hudless_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    hudless_create_info.imageType = VK_IMAGE_TYPE_2D;
+    hudless_create_info.format = frame_generation_format_;
+    hudless_create_info.extent = {extent.width, extent.height, 1};
+    hudless_create_info.mipLevels = 1;
+    hudless_create_info.arrayLayers = 1;
+    hudless_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    hudless_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    configure_desc.HUDLessColor = ffxApiGetResourceVK(
+        hudless_image,
+        ffxApiGetImageResourceDescriptionVK(hudless_image, hudless_create_info,
+                                            FFX_API_RESOURCE_USAGE_READ_ONLY),
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  }
+  if (ffxConfigure(context, &configure_desc.header) != FFX_API_RETURN_OK) {
+    return;
+  }
+
+  const VkExtent2D render_extent =
+      use_guest_inputs ? guest_output_image->frame_generation_input_extent : extent;
+  const VkExtent2D input_image_extent = use_guest_inputs ? guest_output_image->extent() : extent;
+  VkImage depth_image =
+      use_guest_inputs ? guest_output_image->frame_generation_depth() : frame_generation_depth_;
+  VkImage motion_vectors_image = use_guest_inputs
+                                     ? guest_output_image->frame_generation_motion_vectors()
+                                     : frame_generation_motion_vectors_;
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.extent = {input_image_extent.width, input_image_extent.height, 1};
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  image_create_info.format = VK_FORMAT_R32_SFLOAT;
+  FfxApiResource depth =
+      ffxApiGetResourceVK(depth_image,
+                          ffxApiGetImageResourceDescriptionVK(depth_image, image_create_info,
+                                                              FFX_API_RESOURCE_USAGE_DEPTHTARGET),
+                          FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  image_create_info.format = VK_FORMAT_R16G16_SFLOAT;
+  FfxApiResource motion_vectors = ffxApiGetResourceVK(
+      motion_vectors_image,
+      ffxApiGetImageResourceDescriptionVK(motion_vectors_image, image_create_info,
+                                          FFX_API_RESOURCE_USAGE_READ_ONLY),
+      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+
+  ffxDispatchDescFrameGenerationPrepare prepare_desc = {};
+  prepare_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+  prepare_desc.frameID = frame_id;
+  prepare_desc.flags = debug_flags;
+  prepare_desc.commandList = command_buffer;
+  prepare_desc.renderSize.width = render_extent.width;
+  prepare_desc.renderSize.height = render_extent.height;
+  prepare_desc.motionVectorScale.x = float(render_extent.width);
+  prepare_desc.motionVectorScale.y = float(render_extent.height);
+  prepare_desc.frameTimeDelta = frame_time_ms;
+  prepare_desc.cameraNear = use_guest_inputs ? guest_output_image->frame_generation_near : 0.1f;
+  prepare_desc.cameraFar = 1.0e6f;
+  prepare_desc.cameraFovAngleVertical =
+      use_guest_inputs ? guest_output_image->frame_generation_fov_vertical : 1.0472f;
+  prepare_desc.viewSpaceToMetersFactor = 1.0f;
+  prepare_desc.depth = depth;
+  prepare_desc.motionVectors = motion_vectors;
+  ffxDispatch(context, &prepare_desc.header);
+}
+
+VkImage VulkanPresenter::PaintFrameGenerationHudless(VkCommandBuffer command_buffer,
+                                                     const GuestOutputImage* guest_output_image,
+                                                     uint64_t paint_submission_index) {
+  const FrameGenerationHudlessPaint& hudless_paint = frame_generation_hudless_paint_;
+  if (!hudless_paint.valid || !guest_output_image ||
+      !guest_output_image->frame_generation_hudless_valid ||
+      !REXCVAR_GET(fsr3_frame_generation_hudless)) {
+    return VK_NULL_HANDLE;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  const VkExtent2D extent = frame_generation_extent_;
+  if (frame_generation_hudless_render_pass_ == VK_NULL_HANDLE) {
+    // Compatible with the swapchain render pass for its pipelines, read by frame generation.
+    VkAttachmentDescription attachment = {};
+    attachment.format = frame_generation_format_;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference color_attachment = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_attachment;
+    VkSubpassDependency dependencies[2] = {};
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[1].dstStageMask =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    VkRenderPassCreateInfo render_pass_create_info = {};
+    render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    render_pass_create_info.attachmentCount = 1;
+    render_pass_create_info.pAttachments = &attachment;
+    render_pass_create_info.subpassCount = 1;
+    render_pass_create_info.pSubpasses = &subpass;
+    render_pass_create_info.dependencyCount = 2;
+    render_pass_create_info.pDependencies = dependencies;
+    if (dfn.vkCreateRenderPass(device, &render_pass_create_info, nullptr,
+                               &frame_generation_hudless_render_pass_) != VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    // The guest output paint descriptor set layout also has an immutable sampler.
+    VkDescriptorPoolSize pool_sizes[2] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFrameGenerationHudlessCount},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, kFrameGenerationHudlessCount}};
+    VkDescriptorPoolCreateInfo pool_create_info = {};
+    pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_create_info.maxSets = kFrameGenerationHudlessCount;
+    pool_create_info.poolSizeCount = 2;
+    pool_create_info.pPoolSizes = pool_sizes;
+    if (dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr,
+                                   &frame_generation_hudless_descriptor_pool_) != VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    std::array<VkDescriptorSetLayout, kFrameGenerationHudlessCount> set_layouts;
+    set_layouts.fill(guest_output_paint_image_descriptor_set_layout_);
+    VkDescriptorSetAllocateInfo set_allocate_info = {};
+    set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_allocate_info.descriptorPool = frame_generation_hudless_descriptor_pool_;
+    set_allocate_info.descriptorSetCount = kFrameGenerationHudlessCount;
+    set_allocate_info.pSetLayouts = set_layouts.data();
+    if (dfn.vkAllocateDescriptorSets(device, &set_allocate_info,
+                                     frame_generation_hudless_descriptor_sets_.data()) !=
+        VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = frame_generation_format_;
+    image_create_info.extent = {extent.width, extent.height, 1};
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageViewCreateInfo view_create_info = {};
+    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_create_info.format = frame_generation_format_;
+    view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkFramebufferCreateInfo framebuffer_create_info = {};
+    framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebuffer_create_info.renderPass = frame_generation_hudless_render_pass_;
+    framebuffer_create_info.attachmentCount = 1;
+    framebuffer_create_info.width = extent.width;
+    framebuffer_create_info.height = extent.height;
+    framebuffer_create_info.layers = 1;
+    for (uint32_t i = 0; i < kFrameGenerationHudlessCount; ++i) {
+      if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_create_info,
+                                                util::MemoryPurpose::kDeviceLocal,
+                                                frame_generation_hudless_images_[i],
+                                                frame_generation_hudless_memory_[i])) {
+        return VK_NULL_HANDLE;
+      }
+      view_create_info.image = frame_generation_hudless_images_[i];
+      if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
+                                &frame_generation_hudless_views_[i]) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+      }
+      framebuffer_create_info.pAttachments = &frame_generation_hudless_views_[i];
+      if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr,
+                                  &frame_generation_hudless_framebuffers_[i]) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+      }
+    }
+    frame_generation_hudless_submissions_.fill(0);
+    frame_generation_hudless_next_ = 0;
+  }
+  if (frame_generation_hudless_framebuffers_.back() == VK_NULL_HANDLE) {
+    // Failed to create previously.
+    return VK_NULL_HANDLE;
+  }
+
+  uint32_t index = frame_generation_hudless_next_;
+  frame_generation_hudless_next_ = (index + 1) % kFrameGenerationHudlessCount;
+  paint_context_.submission_tracker.AwaitSubmissionCompletion(
+      frame_generation_hudless_submissions_[index]);
+  frame_generation_hudless_submissions_[index] = paint_submission_index;
+
+  VkDescriptorImageInfo descriptor_image_info = {
+      VK_NULL_HANDLE, guest_output_image->frame_generation_hudless_view(),
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkWriteDescriptorSet descriptor_write = {};
+  descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  descriptor_write.dstSet = frame_generation_hudless_descriptor_sets_[index];
+  descriptor_write.descriptorCount = 1;
+  descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  descriptor_write.pImageInfo = &descriptor_image_info;
+  dfn.vkUpdateDescriptorSets(device, 1, &descriptor_write, 0, nullptr);
+
+  VkClearValue clear_value = {};
+  VkRenderPassBeginInfo render_pass_begin_info = {};
+  render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  render_pass_begin_info.renderPass = frame_generation_hudless_render_pass_;
+  render_pass_begin_info.framebuffer = frame_generation_hudless_framebuffers_[index];
+  render_pass_begin_info.renderArea.extent = extent;
+  render_pass_begin_info.clearValueCount = 1;
+  render_pass_begin_info.pClearValues = &clear_value;
+  dfn.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+  dfn.vkCmdSetViewport(command_buffer, 0, 1, &hudless_paint.viewport);
+  dfn.vkCmdSetScissor(command_buffer, 0, 1, &hudless_paint.scissor);
+  dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, hudless_paint.pipeline);
+  dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              hudless_paint.pipeline_layout, 0, 1,
+                              &frame_generation_hudless_descriptor_sets_[index], 0, nullptr);
+  dfn.vkCmdPushConstants(command_buffer, hudless_paint.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                         0, sizeof(hudless_paint.rect_constants), &hudless_paint.rect_constants);
+  if (hudless_paint.effect_constants_size) {
+    dfn.vkCmdPushConstants(command_buffer, hudless_paint.pipeline_layout,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(hudless_paint.rect_constants),
+                           hudless_paint.effect_constants_size, hudless_paint.effect_constants);
+  }
+  dfn.vkCmdDraw(command_buffer, 4, 1, 0, 0);
+  dfn.vkCmdEndRenderPass(command_buffer);
+  static bool hudless_logged = false;
+  if (!hudless_logged) {
+    hudless_logged = true;
+    REXLOG_INFO("VulkanPresenter: FSR 3 frame generation is using the image without the HUD");
+  }
+  return frame_generation_hudless_images_[index];
 }
 #endif
 
@@ -754,6 +1418,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   const VkDevice device = vulkan_device_->device();
 
   VkFormat new_swapchain_format;
+  VkSwapchainCreateInfoKHR swapchain_create_info = {};
 
   // ConnectOrReconnectToSurfaceFromUIThread may be called only for the
   // ui::Surface of the current swapchain or when the old swapchain and
@@ -764,16 +1429,25 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+    DestroyFrameGenerationContext();
+#endif
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+    // A frame generation swapchain is not a Vulkan object that can be retired.
+    if (paint_context_.frame_generation_swapchain_context) {
+      paint_context_.DestroyRetiredSwapchain(old_swapchain);
+      old_swapchain = VK_NULL_HANDLE;
+    }
+#endif
     bool surface_unusable;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        &swapchain_create_info);
     // Destroy the old swapchain that may be retired now.
-    if (old_swapchain != VK_NULL_HANDLE) {
-      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
-    }
+    paint_context_.DestroyRetiredSwapchain(old_swapchain);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Couldn't create the swapchain for the existing surface - start over.
       paint_context_.DestroySwapchainAndVulkanSurface();
@@ -873,7 +1547,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        &swapchain_create_info);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -884,6 +1559,23 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     // Successfully attached (at least for now).
   }
+
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (REXCVAR_GET(fsr3_frame_generation) &&
+      !ReplaceSwapchainForFrameGeneration(swapchain_create_info) &&
+      paint_context_.swapchain == VK_NULL_HANDLE) {
+    // The replacement destroyed the original swapchain - create a normal one again.
+    bool surface_unusable;
+    paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+        vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+        VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+    if (paint_context_.swapchain == VK_NULL_HANDLE) {
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+  }
+#endif
 
   // From now on, in case of failure,
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
@@ -967,7 +1659,13 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   for (;;) {
     uint32_t swapchain_image_count = uint32_t(paint_context_.swapchain_images.size());
     bool swapchain_images_were_empty = !swapchain_image_count;
-    swapchain_images_get_result = dfn.vkGetSwapchainImagesKHR(
+    PFN_vkGetSwapchainImagesKHR get_swapchain_images = dfn.vkGetSwapchainImagesKHR;
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+    if (paint_context_.frame_generation_get_swapchain_images) {
+      get_swapchain_images = paint_context_.frame_generation_get_swapchain_images;
+    }
+#endif
+    swapchain_images_get_result = get_swapchain_images(
         device, paint_context_.swapchain, &swapchain_image_count,
         swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data());
     // If the original swapchain image count was 0 (first call), SUCCESS is
@@ -1041,6 +1739,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
 }
 
 void VulkanPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  DestroyFrameGenerationContext();
+#endif
   paint_context_.DestroySwapchainAndVulkanSurface();
 }
 
@@ -1073,12 +1774,61 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
     image_instance.SetToNewImage(std::move(new_image), guest_output_image_next_version_++);
   }
 
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (paint_context_.frame_generation_swapchain_context &&
+      REXCVAR_GET(fsr3_frame_generation_limit_guest)) {
+    // Let at most one guest frame wait for painting.
+    std::unique_lock<std::mutex> lock(frame_generation_paint_mutex_);
+    frame_generation_paint_cv_.wait_for(lock, std::chrono::milliseconds(50), [this] {
+      return frame_generation_painted_refreshes_.load(std::memory_order_relaxed) >=
+             frame_generation_guest_refreshes_.load(std::memory_order_relaxed);
+    });
+  }
+#endif
   VulkanGuestOutputRefreshContext context(is_8bpc_out_ref, image_instance.image->image(),
                                           image_instance.image->view(), image_instance.version,
                                           image_instance.ever_successfully_refreshed);
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  GuestOutputImage& guest_output_image = *image_instance.image;
+  guest_output_image.frame_generation_camera_valid = false;
+  guest_output_image.frame_generation_hudless_valid = false;
+  if (paint_context_.frame_generation_swapchain_context &&
+      REXCVAR_GET(fsr3_frame_generation_motion_vectors) &&
+      guest_output_image.EnsureFrameGenerationInputs()) {
+    uint64_t display_extent = frame_generation_display_extent_.load(std::memory_order_relaxed);
+    VkExtent2D input_extent = guest_output_image.extent();
+    if (display_extent) {
+      input_extent.width = std::min(input_extent.width, uint32_t(display_extent));
+      input_extent.height = std::min(input_extent.height, uint32_t(display_extent >> 32));
+    }
+    context.SetFrameGenerationInputs(guest_output_image.frame_generation_motion_vectors(),
+                                     guest_output_image.frame_generation_motion_vectors_view(),
+                                     guest_output_image.frame_generation_depth(),
+                                     guest_output_image.frame_generation_depth_view(),
+                                     input_extent);
+    if (REXCVAR_GET(fsr3_frame_generation_hudless)) {
+      context.SetFrameGenerationHudless(guest_output_image.frame_generation_hudless(),
+                                        guest_output_image.frame_generation_hudless_view());
+    }
+  }
+#endif
   bool refresher_succeeded = refresher(context);
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (refresher_succeeded && context.frame_generation_hudless_written()) {
+    guest_output_image.frame_generation_hudless_valid = true;
+  }
+  if (refresher_succeeded && context.frame_generation_camera_valid()) {
+    guest_output_image.frame_generation_camera_valid = true;
+    guest_output_image.frame_generation_input_extent = context.frame_generation_input_extent();
+    guest_output_image.frame_generation_fov_vertical = context.frame_generation_fov_vertical();
+    guest_output_image.frame_generation_near = context.frame_generation_near();
+  }
+#endif
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+    frame_generation_guest_refreshes_.fetch_add(1, std::memory_order_relaxed);
+#endif
   }
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
@@ -1095,10 +1845,18 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
-    const VulkanDevice::Queue::Acquisition queue_acquisition =
-        vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence()) !=
-        VK_SUCCESS) {
+    auto signal = [vulkan_device = vulkan_device_, fence = fence_acqusition.fence()]() {
+      const VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      return vulkan_device->functions().vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
+                                                      fence) == VK_SUCCESS;
+    };
+    bool queued = vulkan_device_->RunInQueueOrder([signal] {
+      if (!signal()) {
+        REXLOG_ERROR("VulkanPresenter: Failed to signal the guest output refresher fence");
+      }
+    });
+    if (!queued && !signal()) {
       fence_acqusition.SubmissionSucceededSignalFailed();
     }
   }
@@ -1109,7 +1867,8 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out,
+    VkSwapchainCreateInfoKHR* create_info_out) {
   ui_surface_unusable_out = false;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
@@ -1381,19 +2140,24 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  bool allow_unsynchronized = true;
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  allow_unsynchronized =
+      !REXCVAR_GET(fsr3_frame_generation) || !REXCVAR_GET(fsr3_frame_generation_vsync);
+#endif
+  if (allow_unsynchronized && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
     // (though on Windows with borderless fullscreen, GDI copying is used
     // instead of independent flip, so it's not supported there).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+  } else if (allow_unsynchronized && REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
              std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
                  present_modes.cend()) {
     // Allowing dropping frames to reduce latency, but no tearing.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
+  } else if (allow_unsynchronized && REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
     // Limiting the frame rate, but lets too long frames cause tearing not to
@@ -1417,6 +2181,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
       uint32_t(swapchain_create_info.presentMode));
 
+  if (create_info_out) {
+    *create_info_out = swapchain_create_info;
+    // Points to a local array, used only with concurrent sharing.
+    create_info_out->pQueueFamilyIndices = nullptr;
+  }
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
   image_extent_out = swapchain_create_info.imageExtent;
@@ -1445,12 +2214,28 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   return old_swapchain;
 }
 
-void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
-  VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
-  if (old_swapchain != VK_NULL_HANDLE) {
-    vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
-                                                     nullptr);
+void VulkanPresenter::PaintContext::DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain) {
+  if (old_swapchain == VK_NULL_HANDLE) {
+    return;
   }
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (frame_generation_swapchain_context) {
+    // Destroys the frame generation swapchain after its presents.
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&frame_generation_swapchain_context), nullptr);
+    frame_generation_swapchain_context = nullptr;
+    frame_generation_get_swapchain_images = nullptr;
+    frame_generation_acquire_next_image = nullptr;
+    frame_generation_queue_present = nullptr;
+    frame_generation_get_present_count = nullptr;
+    return;
+  }
+#endif
+  vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
+                                                   nullptr);
+}
+
+void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+  DestroyRetiredSwapchain(PrepareForSwapchainRetirement());
   present_queue_family = UINT32_MAX;
   if (vulkan_surface != VK_NULL_HANDLE) {
     const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
@@ -1463,6 +2248,16 @@ void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
 VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, frame_generation_depth_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, frame_generation_depth_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, frame_generation_depth_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
+                             frame_generation_motion_vectors_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, frame_generation_hudless_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, frame_generation_hudless_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, frame_generation_hudless_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, frame_generation_motion_vectors_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, frame_generation_motion_vectors_memory_);
   if (view_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_, nullptr);
   }
@@ -1472,6 +2267,76 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   if (memory_ != VK_NULL_HANDLE) {
     dfn.vkFreeMemory(device, memory_, nullptr);
   }
+}
+
+bool VulkanPresenter::GuestOutputImage::EnsureFrameGenerationInputs() {
+  if (frame_generation_depth_view_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (frame_generation_inputs_failed_) {
+    return false;
+  }
+  // Not retrying if failed.
+  frame_generation_inputs_failed_ = true;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.extent = {extent_.width, extent_.height, 1};
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  image_create_info.format = VK_FORMAT_R16G16_SFLOAT;
+  view_create_info.format = image_create_info.format;
+  if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_create_info,
+                                            util::MemoryPurpose::kDeviceLocal,
+                                            frame_generation_motion_vectors_,
+                                            frame_generation_motion_vectors_memory_)) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the frame generation motion vectors");
+    return false;
+  }
+  view_create_info.image = frame_generation_motion_vectors_;
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
+                            &frame_generation_motion_vectors_view_) != VK_SUCCESS) {
+    return false;
+  }
+  image_create_info.format = VK_FORMAT_R32_SFLOAT;
+  view_create_info.format = image_create_info.format;
+  if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_create_info,
+                                            util::MemoryPurpose::kDeviceLocal,
+                                            frame_generation_depth_,
+                                            frame_generation_depth_memory_)) {
+    return false;
+  }
+  view_create_info.image = frame_generation_depth_;
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &frame_generation_depth_view_) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  image_create_info.format = kGuestOutputFormat;
+  view_create_info.format = image_create_info.format;
+  if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_create_info,
+                                            util::MemoryPurpose::kDeviceLocal,
+                                            frame_generation_hudless_,
+                                            frame_generation_hudless_memory_)) {
+    return false;
+  }
+  view_create_info.image = frame_generation_hudless_;
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
+                            &frame_generation_hudless_view_) != VK_SUCCESS) {
+    return false;
+  }
+  frame_generation_inputs_failed_ = false;
+  return true;
 }
 
 bool VulkanPresenter::GuestOutputImage::Initialize() {
@@ -1529,6 +2394,27 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (paint_context_.frame_generation_swapchain_context) {
+    // Interpolating between repaints of the same guest frame only adds latency - repaint
+    // without a new guest frame only to keep the UI responsive while the guest is idle.
+    uint64_t guest_refreshes = frame_generation_guest_refreshes_.load(std::memory_order_relaxed);
+    uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+    if (guest_refreshes == frame_generation_painted_refresh_ &&
+        now_ns - frame_generation_last_paint_ns_ < 50000000ull) {
+      return PaintResult::kNotPresented;
+    }
+    frame_generation_painted_refresh_ = guest_refreshes;
+    frame_generation_hudless_paint_.valid = false;
+    {
+      std::lock_guard<std::mutex> lock(frame_generation_paint_mutex_);
+      frame_generation_painted_refreshes_.store(guest_refreshes, std::memory_order_relaxed);
+    }
+    frame_generation_paint_cv_.notify_all();
+  }
+#endif
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
@@ -1569,9 +2455,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
+  PFN_vkAcquireNextImageKHR acquire_next_image = dfn.vkAcquireNextImageKHR;
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (paint_context_.frame_generation_acquire_next_image) {
+    acquire_next_image = paint_context_.frame_generation_acquire_next_image;
+  }
+#endif
   VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+      acquire_next_image(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                         VK_NULL_HANDLE, &swapchain_image_index);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -1840,6 +2732,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
+            } else {
+              // Otherwise the pipeline is recreated, awaiting the GPU, on every paint.
+              swapchain_effect_pipeline.swapchain_format =
+                  paint_context_.swapchain_render_pass_format;
             }
           }
         }
@@ -2027,7 +2923,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           uint32_t effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
             FsrEasuConstants fsr_easu;
@@ -2039,7 +2935,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
             } break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
             case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
               effect_constants_size = sizeof(effect_constants.cas_sharpen);
               effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
@@ -2069,6 +2965,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
 
           dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+          if (is_final_effect && paint_context_.frame_generation_swapchain_context) {
+            static_assert(sizeof(effect_constants) <=
+                          sizeof(frame_generation_hudless_paint_.effect_constants));
+            FrameGenerationHudlessPaint& hudless_paint = frame_generation_hudless_paint_;
+            hudless_paint.valid = guest_output_flow.effect_count == 1;
+            hudless_paint.pipeline = effect_vulkan_pipeline;
+            hudless_paint.pipeline_layout = guest_output_paint_pipeline_layout;
+            hudless_paint.viewport = guest_output_viewport;
+            hudless_paint.scissor = guest_output_scissor;
+            hudless_paint.rect_constants = effect_rect_constants;
+            hudless_paint.effect_constants_size = effect_constants_size;
+            std::memcpy(hudless_paint.effect_constants, &effect_constants, effect_constants_size);
+          }
+#endif
 
           if (is_final_effect) {
             // Clear the letterbox around the guest output if the guest output
@@ -2152,6 +3064,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
+
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (paint_context_.frame_generation_swapchain_context) {
+    PrepareFrameGeneration(draw_command_buffer, guest_output_image.get(),
+                           current_paint_submission_index);
+  }
+#endif
 
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
@@ -2237,6 +3156,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
   VkResult present_result;
+#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
+  if (paint_context_.frame_generation_queue_present) {
+    // Submits to the game queue through FrameGenerationGameQueueSubmit, which locks it, and
+    // may wait for its present thread, so the queue must not stay locked here.
+    VkQueue game_queue =
+        vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0).queue();
+    present_result = paint_context_.frame_generation_queue_present(game_queue, &present_info);
+  } else
+#endif
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
@@ -2334,7 +3262,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       case kGuestOutputPaintPipelineLayoutIndexBilinear:
         guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
         break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       case kGuestOutputPaintPipelineLayoutIndexCasSharpen:
         guest_output_paint_push_constant_range_ffx.size = sizeof(CasSharpenConstants);
         break;
@@ -2389,7 +3317,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
         shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
         break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FFX_SPATIAL)
       case GuestOutputPaintEffect::kCasSharpen:
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_cas_sharpen_ps);
         shader_module_create_info.pCode = shaders::guest_output_ffx_cas_sharpen_ps;

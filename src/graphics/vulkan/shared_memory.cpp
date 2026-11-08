@@ -195,6 +195,7 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
 
 void VulkanSharedMemory::EndSubmission() {
   upload_buffer_pool_->FlushWrites();
+  ResetSubmissionUsage();
 }
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
@@ -281,7 +282,19 @@ bool VulkanSharedMemory::UploadRanges(
                       upload_page_ranges.front().first)
                          << page_size_log2()));
   command_processor_.SubmitBarriers(true);
-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  return CopyRanges(upload_page_ranges, command_processor_.deferred_command_buffer());
+}
+
+bool VulkanSharedMemory::UploadRangesAtSubmissionStart(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+  // Ordered by the barriers around the submission start commands.
+  return CopyRanges(upload_page_ranges,
+                    command_processor_.deferred_submission_start_command_buffer());
+}
+
+bool VulkanSharedMemory::CopyRanges(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges,
+    DeferredCommandBuffer& command_buffer) {
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();

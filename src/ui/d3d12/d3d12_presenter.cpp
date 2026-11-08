@@ -13,6 +13,9 @@
 #include <climits>
 #include <cmath>
 #include <memory>
+#include <string_view>
+#include <string>
+#include <vector>
 #include <utility>
 
 #include <rex/assert.h>
@@ -24,7 +27,12 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 #include <rex/ui/surface_win.h>
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+// FidelityFX for D3D12 is loaded at run time rather than linked, so it can be a newer SDK than
+// the one the Vulkan presenter is built with: the loader of AMD's FSR SDK 2.x
+// (amd_fidelityfx_loader_dx12.dll) picks FSR 4 on GPUs that support it, FSR 3.1 otherwise.
+// FidelityFX SDK 1.x (amd_fidelityfx_dx12.dll) works too.
+#if defined(REX_HAS_FIDELITYFX_SDK)
+#define REX_HAS_FFX_DX12 1
 #include <ffx_api/dx12/ffx_api_dx12.h>
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.h>
@@ -32,8 +40,90 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
+REXCVAR_DEFINE_STRING(d3d12_fsr_version, "", "UI/D3D12",
+                      "FSR upscaler version to use from the FidelityFX runtime, as listed in "
+                      "d3d12_fsr_versions (for example 4.1.1); empty for the newest")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(d3d12_fsr_versions, "", "UI/D3D12",
+                      "Set by the renderer: the FSR upscaler versions the FidelityFX runtime "
+                      "offers on this GPU, newest first, separated by ';'");
 
 namespace rex::ui::d3d12 {
+
+#if defined(REX_HAS_FFX_DX12)
+namespace {
+struct FfxDx12Functions {
+  PfnFfxCreateContext create_context;
+  PfnFfxDestroyContext destroy_context;
+  PfnFfxQuery query;
+  PfnFfxDispatch dispatch;
+};
+
+// Null if no FidelityFX D3D12 runtime is next to the executable.
+const FfxDx12Functions* FfxDx12() {
+  static const FfxDx12Functions* functions = []() -> const FfxDx12Functions* {
+    for (const wchar_t* name : {L"amd_fidelityfx_loader_dx12.dll", L"amd_fidelityfx_dx12.dll"}) {
+      HMODULE module = LoadLibraryW(name);
+      if (!module) continue;
+      static FfxDx12Functions loaded;
+      loaded.create_context =
+          reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(module, "ffxCreateContext"));
+      loaded.destroy_context =
+          reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(module, "ffxDestroyContext"));
+      loaded.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(module, "ffxQuery"));
+      loaded.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(module, "ffxDispatch"));
+      if (loaded.create_context && loaded.destroy_context && loaded.query && loaded.dispatch) {
+        REXLOG_INFO("D3D12Presenter: FidelityFX runtime {}",
+                    name == std::wstring_view(L"amd_fidelityfx_dx12.dll") ? "1.x" : "2.x loader");
+        return &loaded;
+      }
+      FreeLibrary(module);
+    }
+    REXLOG_WARN("D3D12Presenter: no FidelityFX D3D12 runtime found; FSR is unavailable");
+    return nullptr;
+  }();
+  return functions;
+}
+
+// The upscaler versions the runtime offers on this device, newest first. Also published in
+// d3d12_fsr_versions so a settings UI can list them.
+struct FfxUpscalerVersions {
+  std::vector<uint64_t> ids;
+  std::vector<std::string> names;
+};
+
+const FfxUpscalerVersions& QueryUpscalerVersions(ID3D12Device* device) {
+  static FfxUpscalerVersions versions;
+  static bool queried = false;
+  if (queried || !FfxDx12()) return versions;
+  queried = true;
+  uint64_t count = 0;
+  ffxQueryDescGetVersions query = {};
+  query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+  query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+  query.device = device;
+  query.outputCount = &count;
+  if (FfxDx12()->query(nullptr, &query.header) != FFX_API_RETURN_OK || !count) return versions;
+  versions.ids.resize(size_t(count));
+  std::vector<const char*> names(size_t(count), nullptr);
+  query.versionIds = versions.ids.data();
+  query.versionNames = names.data();
+  if (FfxDx12()->query(nullptr, &query.header) != FFX_API_RETURN_OK) {
+    versions.ids.clear();
+    return versions;
+  }
+  versions.ids.resize(size_t(count));
+  std::string list;
+  for (size_t i = 0; i < size_t(count); ++i) {
+    versions.names.emplace_back(names[i] ? names[i] : "");
+    list += (i ? ";" : "") + versions.names.back();
+  }
+  REXLOG_INFO("D3D12Presenter: FidelityFX upscaler versions: {}", list);
+  rex::cvar::SetFlagByName("d3d12_fsr_versions", list);
+  return versions;
+}
+}  // namespace
+#endif
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -58,18 +148,18 @@ D3D12Presenter::~D3D12Presenter() {
   paint_context_.AwaitSwapChainUsageCompletion();
   guest_output_resource_refresher_submission_tracker_.Shutdown();
   ui_submission_tracker_.Shutdown();
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_DX12)
   DestroyTemporalUpscalerContext();
 #endif
 }
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_DX12)
 void D3D12Presenter::DestroyTemporalUpscalerContext() {
   if (!temporal_upscaler_context_) {
     return;
   }
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  ffxDestroyContext(context, nullptr);
+  FfxDx12()->destroy_context(context, nullptr);
   temporal_upscaler_context_ = nullptr;
   temporal_upscaler_max_render_width_ = 0;
   temporal_upscaler_max_render_height_ = 0;
@@ -79,6 +169,9 @@ void D3D12Presenter::DestroyTemporalUpscalerContext() {
 
 bool D3D12Presenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                                    uint32_t output_width, uint32_t output_height) {
+  if (!FfxDx12()) {
+    return false;
+  }
   if (!temporal_upscaler_context_ || temporal_upscaler_max_render_width_ != render_width ||
       temporal_upscaler_max_render_height_ != render_height ||
       temporal_upscaler_max_output_width_ != output_width ||
@@ -88,7 +181,7 @@ bool D3D12Presenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32
     ffxCreateContextDescUpscale create_desc = {};
     create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create_desc.header.pNext = nullptr;
-    create_desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    create_desc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     create_desc.maxRenderSize.width = render_width;
     create_desc.maxRenderSize.height = render_height;
     create_desc.maxUpscaleSize.width = output_width;
@@ -102,8 +195,28 @@ bool D3D12Presenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32
 
     create_desc.header.pNext = &backend_desc.header;
 
+    // A version picked in the settings, matched by the start of its name ("4.1.1").
+    ffxOverrideVersion override_version = {};
+    const std::string wanted_version = REXCVAR_GET(d3d12_fsr_version);
+    if (!wanted_version.empty()) {
+      const FfxUpscalerVersions& versions = QueryUpscalerVersions(provider_.GetDevice());
+      for (size_t i = 0; i < versions.ids.size(); ++i) {
+        if (versions.names[i].starts_with(wanted_version)) {
+          override_version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+          override_version.versionId = versions.ids[i];
+          backend_desc.header.pNext = &override_version.header;
+          REXLOG_INFO("D3D12Presenter: using FSR {}", versions.names[i]);
+          break;
+        }
+      }
+      if (!backend_desc.header.pNext) {
+        REXLOG_WARN("D3D12Presenter: FSR {} is not offered on this GPU; using the newest",
+                    wanted_version);
+      }
+    }
+
     ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-    if (ffxCreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
+    if (FfxDx12()->create_context(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
       REXLOG_WARN("D3D12Presenter: Failed to create FidelityFX temporal upscaler context");
       temporal_upscaler_context_ = nullptr;
       return false;
@@ -121,7 +234,7 @@ bool D3D12Presenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32
     provider_version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     provider_version.header.pNext = nullptr;
     ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-    if (ffxQuery(context, &provider_version.header) == FFX_API_RETURN_OK &&
+    if (FfxDx12()->query(context, &provider_version.header) == FFX_API_RETURN_OK &&
         provider_version.versionName) {
       REXLOG_INFO("D3D12Presenter: FidelityFX upscaler provider {}", provider_version.versionName);
     }
@@ -186,7 +299,7 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
   dispatch_desc.flags = 0;
 
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  if (ffxDispatch(context, &dispatch_desc.header) != FFX_API_RETURN_OK) {
+  if (FfxDx12()->dispatch(context, &dispatch_desc.header) != FFX_API_RETURN_OK) {
     return false;
   }
 
@@ -790,7 +903,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
       D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
           view_heap->GetGPUDescriptorHandleForHeapStart();
       bool temporal_effect_selected = false;
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_DX12)
       temporal_effect_selected =
           guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
           guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
@@ -807,7 +920,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
 
         GuestOutputPaintEffect effect = guest_output_flow.effects[i];
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_DX12)
         bool use_temporal_upscaler = is_temporal_easu_effect(i);
 #else
         bool use_temporal_upscaler = false;
@@ -855,7 +968,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           effect_rect_y = 0;
         }
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+#if defined(REX_HAS_FFX_DX12)
         bool temporal_dispatch_done = false;
         if (use_temporal_upscaler) {
           uint32_t effect_input_width = 0, effect_input_height = 0;
@@ -1186,6 +1299,11 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   }
 
   ID3D12Device* device = provider_.GetDevice();
+
+#if defined(REX_HAS_FFX_DX12)
+  // List the FSR versions early, for the settings shown before anything is upscaled.
+  QueryUpscalerVersions(device);
+#endif
 
   // Initialize static guest output painting objects.
 

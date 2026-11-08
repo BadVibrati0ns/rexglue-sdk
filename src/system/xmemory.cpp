@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
@@ -637,6 +638,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
 bool Memory::AccessViolationCallbackThunk(
     std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
     void* host_address, bool is_write) {
+  PERF_counter_inc(kPageFaults);
   return reinterpret_cast<memory::Memory*>(context)->AccessViolationCallback(
       std::move(global_lock_locked_once), host_address, is_write);
 }
@@ -2159,6 +2161,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       }
     } else {
       if (protect_system_page_first != UINT32_MAX) {
+        PERF_counter_inc(kPageProtectCalls);
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                              (i - protect_system_page_first) * system_page_size_, protect_access);
         protect_system_page_first = UINT32_MAX;
@@ -2166,6 +2169,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     }
   }
   if (protect_system_page_first != UINT32_MAX) {
+    PERF_counter_inc(kPageProtectCalls);
     rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);

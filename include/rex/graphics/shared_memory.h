@@ -11,6 +11,7 @@
  */
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -32,6 +33,9 @@ class SharedMemory {
   // Call in the implementation-specific ClearCache.
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
+  // Called when the backend ends a submission: the pages used by commands of
+  // the next one are tracked from scratch (see UploadRangesAtSubmissionStart).
+  void ResetSubmissionUsage();
   void InvalidateAllPages();
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
@@ -139,6 +143,13 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+  // Like UploadRanges, for pages no command in the current submission has used
+  // yet, so the copies may be done before all of them, for instance not to
+  // interrupt render passes.
+  virtual bool UploadRangesAtSubmissionStart(
+      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+    return UploadRanges(upload_page_ranges);
+  }
 
  private:
   memory::Memory& memory_;
@@ -174,7 +185,77 @@ class SharedMemory {
   std::vector<uint64_t> system_page_flags_valid_;
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
+  // Pages the GPU has requested at least once. Uploads may be widened to
+  // invalid pages in this set (shared_memory_upload_window_kb), so that one
+  // write fault does not cost one re-protection per later draw.
+  std::vector<uint64_t> system_page_flags_requested_;
+  std::vector<std::pair<uint32_t, uint32_t>> upload_windows_;
+  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges_;
   uint32_t num_system_page_flags_ = 0;
+
+  // Pages the CPU keeps rewriting between GPU requests ("hot",
+  // shared_memory_hot_page_uploads) are not write-protected after every upload,
+  // which would cost a VirtualProtect and an access violation each time.
+  // Instead, their contents are compared with a copy taken before the upload
+  // whenever the GPU requests them.
+  struct HotPage {
+    std::unique_ptr<uint8_t[]> shadow;
+    uint32_t unchanged_requests = 0;
+  };
+  // Hot pages that stayed unchanged this many requests are protected again.
+  static constexpr uint32_t kHotPageUnchangedRequestsToProtect = 256;
+  std::vector<uint64_t> system_page_flags_hot_;
+  std::vector<uint8_t> page_upload_counts_;
+  // Indexed by page, a hot page has a shadow.
+  std::vector<HotPage> hot_pages_;
+  uint32_t hot_page_count_ = 0;
+  std::vector<uint32_t> hot_pages_to_protect_;
+  // Changed hot pages found when a watch was added, to fire watches for later.
+  std::vector<uint32_t> hot_pages_changed_under_watch_;
+  std::vector<std::pair<uint32_t, uint32_t>> protect_page_runs_;
+  // Pages of the range made valid that are already protected (scratch for MakeRangeValid).
+  std::vector<uint64_t> protected_page_blocks_;
+  // Pages requested or written by the GPU in the current submission.
+  std::vector<uint64_t> system_page_flags_used_in_submission_;
+  // For pages used in the submission, the bytes used: first in the low half, end in the high.
+  std::vector<uint32_t> page_used_bytes_;
+  // Pages uploaded in order (not at the submission start) in the current submission.
+  std::vector<uint64_t> system_page_flags_uploaded_in_order_;
+  // Marks bytes [start, start + length) as used by the GPU in this submission.
+  void MarkUsedInSubmission(uint32_t start, uint32_t length);
+  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_in_submission_;
+  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_at_submission_start_;
+  bool IsPageWatched(uint32_t page) const;
+
+ public:
+  struct Stats {
+    uint64_t upload_bytes_in_order = 0;
+    uint64_t upload_bytes_at_start = 0;
+    uint64_t hot_compare_bytes = 0;
+    uint64_t hot_pages_changed = 0;
+    uint64_t requests = 0;
+    uint64_t repeat_compare_bytes = 0;
+    // 0: total, 1: before the hot pages, 2: waiting for the lock, 3: hot page compares,
+    // 4: protecting hot pages and watches, 5: marking and splitting uploads,
+    // 6: uploads at the submission start, 7: uploads in order.
+    uint64_t ticks[8] = {};
+    // By request_tag_: 0 other, 1 vertex buffers, 2 index buffers, 3 textures.
+    uint64_t tag_compare_bytes[4] = {};
+    uint64_t tag_pages_changed[4] = {};
+    uint64_t tag_requests[4] = {};
+  };
+  uint32_t request_tag_ = 0;
+  Stats TakeStats() {
+    Stats stats = stats_;
+    stats_ = {};
+    return stats;
+  }
+
+ protected:
+  Stats stats_;
+  // Protects hot pages again, and invalidates them if they have changed since
+  // the last upload. Returns whether any of them has changed.
+  bool ProtectHotPages(const std::vector<uint32_t>& pages);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

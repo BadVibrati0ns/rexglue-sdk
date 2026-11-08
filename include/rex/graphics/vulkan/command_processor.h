@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/perf/counter.h>
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -47,6 +49,25 @@ namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
+  // GPU time attributed by vulkan_gpu_timing to the segment ending at a mark.
+  enum class GpuTimingCategory : uint16_t {
+    kOther,
+    kTransfer,
+    kResolve,
+    kCount,
+  };
+  void GpuTimingMark(GpuTimingCategory previous_segment);
+  // Adds an entry to the logged frame sequence (vulkan_log_frame_sequence).
+  bool IsGpuTimingSequenceActive() const { return gpu_timing_sequence_active_; }
+  void GpuTimingSequence(std::string_view entry);
+  bool IsGpuTimingActive() const { return gpu_timing_frame_active_; }
+  // Named subdivisions of a category, logged separately.
+  GpuTimingCategory GpuTimingNamedCategory(const std::string& name);
+  // Where kOther segments go from now on: the draws to the bound render targets.
+  void GpuTimingSetDrawCategory(GpuTimingCategory category) {
+    gpu_timing_draw_category_ = category;
+  }
+
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
@@ -148,6 +169,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   DeferredCommandBuffer& deferred_command_buffer() {
     assert_true(submission_open_);
     return deferred_command_buffer_;
+  }
+  // Transfers executed at the start of the current submission, before the
+  // commands in deferred_command_buffer(), between full shared memory barriers.
+  DeferredCommandBuffer& deferred_submission_start_command_buffer() {
+    assert_true(submission_open_);
+    return deferred_submission_start_command_buffer_;
   }
 
   bool submission_open() const { return submission_open_; }
@@ -387,6 +414,27 @@ class VulkanCommandProcessor : public CommandProcessor {
     float size_inv[2];
   };
 
+  // Camera of the main 3D pass of a frame, for FSR 3 frame generation motion vectors.
+  struct FrameGenerationCamera {
+    bool valid = false;
+    uint32_t depth_key;
+    uint32_t depth_pitch_tiles_at_32bpp;
+    // From world space to host render target pixels and depth multiplied by W, and W, for row
+    // vectors.
+    double world_to_pixels[4][4];
+    float fov_vertical;
+    float near_z;
+  };
+  struct FrameGenerationMotionVectorsConstants {
+    // From current host render target pixels and depth to the previous ones, column-major.
+    float reprojection[16];
+    // Host render target pixels per guest output pixel.
+    float depth_scale[2];
+    // From host render target pixels to the guest output UV.
+    float motion_vector_scale[2];
+    uint32_t size[2];
+  };
+
   // Framebuffer for the current presenter's guest output image revision, and
   // its usage tracking.
   struct SwapFramebuffer {
@@ -482,6 +530,25 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t half_pixel_offset;
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
+  // Records the camera of the draw if it may be of the main 3D pass of the frame.
+  void UpdateFrameGenerationCamera(const Shader& vertex_shader,
+                                   reg::RB_DEPTHCONTROL normalized_depth_control,
+                                   const draw_util::ViewportInfo& viewport_info);
+  // The image the front buffer was resolved from before the HUD was drawn over it in the frame,
+  // the last resolve of the same render target to an image of the same size, or 0.
+  uint32_t TakeFrameGenerationHudlessAddress(uint32_t frontbuffer_ptr);
+  // Writes the guest output without the HUD if requested, like the guest output.
+  void WriteFrameGenerationHudless(
+      ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext& context,
+      uint32_t hudless_address, uint32_t width, uint32_t height,
+      xenos::TextureFormat frontbuffer_format, VkPipeline pipeline,
+      VkDescriptorSet gamma_ramp_descriptor_set, uint32_t frame_index);
+  // Writes the frame generation motion vectors and depth of the guest output if requested and
+  // possible, and makes the camera the previous one.
+  void WriteFrameGenerationMotionVectors(
+      ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext& context,
+      const FrameGenerationCamera& camera, uint32_t width, uint32_t height, bool source_scaled,
+      uint32_t frame_index);
   void DestroySwapFxaaSourceImage();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
@@ -532,6 +599,65 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
+
+  void GpuTimingBeginFrame();
+  static constexpr uint32_t kGpuTimingQueriesPerFrame = 4096;
+  bool gpu_timing_sequence_active_ = false;
+  static constexpr uint32_t kDrawSectionCount = 15;
+  uint64_t draw_section_last_tsc_ = 0;
+  uint64_t draw_section_ticks_frame_[kDrawSectionCount] = {};
+  uint64_t draw_section_ticks_total_[kDrawSectionCount] = {};
+  uint64_t draw_section_frames_ = 0;
+  // 0: all fence waits, 1: waits for the latest submission; [2] and [3] are their counts.
+  uint64_t fence_wait_ticks_frame_[4] = {};
+  uint64_t fence_wait_ticks_total_[4] = {};
+  uint64_t draw_section_calibration_tsc_ = 0;
+  uint64_t draw_section_calibration_ns_ = 0;
+  void DrawSectionMark(uint32_t section) {
+    if (gpu_timing_frame_active_) {
+      uint64_t tsc = rex::perf::ReadTicks();
+      draw_section_ticks_frame_[section] += tsc - draw_section_last_tsc_;
+      draw_section_last_tsc_ = tsc;
+    }
+  }
+  uint32_t gpu_timing_sequences_logged_ = 0;
+  std::string gpu_timing_sequence_;
+  VkQueryPool gpu_timing_pool_ = VK_NULL_HANDLE;
+  bool gpu_timing_frame_active_ = false;
+  uint32_t gpu_timing_slot_ = 0;
+  std::array<uint32_t, kMaxFramesInFlight> gpu_timing_counts_{};
+  std::array<std::array<GpuTimingCategory, kGpuTimingQueriesPerFrame>, kMaxFramesInFlight>
+      gpu_timing_categories_{};
+  uint64_t gpu_timing_last_frame_start_ = 0;
+  double gpu_timing_total_ms_ = 0.0;
+  std::vector<double> gpu_timing_category_ms_ =
+      std::vector<double>(size_t(GpuTimingCategory::kCount));
+  std::vector<uint32_t> gpu_timing_category_segments_ =
+      std::vector<uint32_t>(size_t(GpuTimingCategory::kCount));
+  std::vector<std::string> gpu_timing_names_;
+  std::unordered_map<std::string, uint16_t> gpu_timing_name_ids_;
+  uint32_t gpu_timing_frames_ = 0;
+  GpuTimingCategory gpu_timing_draw_category_ = GpuTimingCategory::kOther;
+  std::array<uint32_t, kMaxFramesInFlight> gpu_timing_draws_{};
+  uint32_t gpu_timing_last_frame_draws_ = 0;
+  // Frames whose segments went into the category breakdown.
+  uint32_t gpu_timing_broken_down_frames_ = 0;
+  // Why render passes ended, in the frame being recorded and summed over broken-down frames.
+  struct RenderPassBreaks {
+    uint32_t begins = 0;
+    uint32_t barriers_with_images = 0;
+    uint32_t barriers_buffers_only = 0;
+    uint32_t occlusion_queries = 0;
+  };
+  RenderPassBreaks gpu_timing_breaks_frame_;
+  RenderPassBreaks gpu_timing_breaks_total_;
+  std::map<uint64_t, uint32_t> gpu_timing_buffer_break_kinds_;
+  double gpu_timing_last_frame_busy_ms_ = 0.0;
+  // Frames with 0-500, 500-1000, 1000-1500 and 1500+ draws: start to start, and with marks.
+  std::array<double, 4> gpu_timing_bucket_ms_{};
+  std::array<double, 4> gpu_timing_bucket_busy_ms_{};
+  std::array<uint32_t, 4> gpu_timing_bucket_frames_{};
+  uint64_t gpu_timing_log_ns_ = 0;
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
@@ -552,6 +678,19 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  DeferredCommandBuffer deferred_submission_start_command_buffer_;
+
+  // vulkan_async_submission: the command streams of the submission being replayed into a Vulkan
+  // command buffer and submitted by the submission thread.
+  class SubmissionThread;
+  VkResult RecordAndSubmit(const CommandBuffer& command_buffer, VkFence fence,
+                           const std::vector<VkSemaphore>& wait_semaphores,
+                           const std::vector<VkPipelineStageFlags>& wait_stage_masks,
+                           DeferredCommandBuffer& start_command_buffer,
+                           DeferredCommandBuffer& main_command_buffer);
+  std::shared_ptr<SubmissionThread> submission_thread_;
+  DeferredCommandBuffer deferred_command_buffer_submitting_;
+  DeferredCommandBuffer deferred_submission_start_command_buffer_submitting_;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
@@ -566,11 +705,49 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Temporary storage with reusable memory for writing image and sampler
   // descriptors.
   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
+  // The last texture and sampler descriptor set written for each shader stage
+  // (0 - vertex, 1 - pixel) in the current submission. Draws with identical
+  // bindings reuse it instead of writing and binding a new set.
+  struct LastTextureDescriptorSet {
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    std::vector<VkDescriptorImageInfo> image_info;
+  };
+  LastTextureDescriptorSet last_texture_descriptor_sets_[2];
+
+  // vulkan_dynamic_constant_buffers, fixed at startup (the descriptor set layout depends on it).
+  bool dynamic_constant_buffers_ = false;
+  struct ConstantsDescriptorSetKey {
+    uint64_t buffers[SpirvShaderTranslator::kConstantBufferCount];
+    uint64_t ranges[SpirvShaderTranslator::kConstantBufferCount];
+    bool operator==(const ConstantsDescriptorSetKey& other) const {
+      return !std::memcmp(this, &other, sizeof(*this));
+    }
+    struct Hasher {
+      size_t operator()(const ConstantsDescriptorSetKey& key) const {
+        return size_t(XXH3_64bits(&key, sizeof(key)));
+      }
+    };
+  };
+  std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet, ConstantsDescriptorSetKey::Hasher>
+      constants_dynamic_descriptor_sets_;
+  std::vector<VkDescriptorPool> constants_dynamic_descriptor_pools_;
+  uint32_t constants_dynamic_descriptor_pool_sets_left_ = 0;
+  uint32_t current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount] =
+      {};
+  VkDescriptorSet GetConstantsDynamicDescriptorSet();
+  void DestroyConstantsDynamicDescriptorSets();
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
   // Descriptor set layouts used by different shaders.
   VkDescriptorSetLayout descriptor_set_layout_empty_ = VK_NULL_HANDLE;
+  // A descriptor set with the empty layout, bound in place of unused vertex
+  // texture sets so the constants and the pixel textures, which usually change
+  // together, can be bound with a single command.
+  VkDescriptorPool descriptor_pool_empty_ = VK_NULL_HANDLE;
+  VkDescriptorSet descriptor_set_empty_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptor_set_layout_constants_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSetLayout, size_t(SingleTransientDescriptorLayout::kCount)>
       descriptor_set_layouts_single_transient_{};
@@ -697,6 +874,24 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkImageView swap_fxaa_source_image_view_ = VK_NULL_HANDLE;
   uint32_t swap_fxaa_source_image_width_ = 0;
   uint32_t swap_fxaa_source_image_height_ = 0;
+
+  FrameGenerationCamera frame_generation_camera_;
+  struct FrameResolve {
+    uint32_t dest_base;
+    uint32_t dest_pitch;
+    uint32_t color_info;
+  };
+  // Resolves of the current frame, for finding the image without the HUD.
+  std::vector<FrameResolve> frame_resolves_;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> frame_generation_hudless_source_descriptors_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight>
+      frame_generation_hudless_destination_descriptors_{};
+  FrameGenerationCamera frame_generation_previous_camera_;
+  VkDescriptorSetLayout frame_generation_motion_vectors_descriptor_set_layout_ = VK_NULL_HANDLE;
+  VkDescriptorPool frame_generation_motion_vectors_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> frame_generation_motion_vectors_descriptors_{};
+  VkPipelineLayout frame_generation_motion_vectors_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline frame_generation_motion_vectors_pipeline_ = VK_NULL_HANDLE;
   uint64_t swap_fxaa_source_image_submission_ = 0;
   VkPipelineStageFlags swap_fxaa_source_stage_mask_ = 0;
   VkAccessFlags swap_fxaa_source_access_mask_ = 0;
@@ -806,6 +1001,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+  // Index buffer currently bound to the command buffer, always at offset 0,
+  // with draws selecting their part of it via firstIndex.
+  VkBuffer current_index_buffer_;
+  VkIndexType current_index_type_;
   VkDescriptorBufferInfo
       current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount];
   // Whether up-to-date data has been written to constant (uniform) buffers, and

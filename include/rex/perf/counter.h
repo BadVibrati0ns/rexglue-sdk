@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -17,7 +18,32 @@
 #include <tracy/Tracy.hpp>
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
+
+// Lets hosts detect kMarker when building against older SDK headers.
+#define REXGLUE_PERF_HAS_MARKER 1
+
 namespace rex::perf {
+
+// Cheap monotonic tick count for timing short sections; the unit depends on the CPU, so only
+// differences and ratios against another clock are meaningful.
+inline uint64_t ReadTicks() {
+#if defined(_M_X64) || defined(__x86_64__)
+  return __rdtsc();
+#elif defined(__aarch64__)
+  uint64_t ticks;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+  return ticks;
+#else
+  return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
 
 enum class CounterId : uint16_t {
   // Frame
@@ -48,6 +74,20 @@ enum class CounterId : uint16_t {
   kTextureCacheMisses,
   kPipelineCacheHits,
   kPipelineCacheMisses,
+
+  // Host-defined event code for the frame (e.g. a measurement window boundary)
+  kMarker,
+
+  // GPU command processor thread time per frame, in nanoseconds
+  kGpuBusyNs,  // inside ExecutePrimaryBuffer
+  kGpuWaitNs,  // of which polling guest memory/registers in WAIT_REG_MEM
+
+  // Write watches on guest memory (GPU caches of CPU data)
+  kPageProtectCalls,  // VirtualProtect calls that start watching pages
+  kPageFaults,        // write faults on watched pages
+
+  // State of the perf_ab_cvar setting during the frame (0 or 1)
+  kAbState,
 
   kCount  // sentinel -- must be last
 };
@@ -132,6 +172,70 @@ class Profiler {
 
 }  // namespace rex::perf
 
+namespace rex::perf {
+
+// Adds the lifetime of the scope, in nanoseconds, to an accumulator counter.
+class ScopedTimeCounter {
+ public:
+  explicit ScopedTimeCounter(CounterId id) : id_(id), start_(std::chrono::steady_clock::now()) {}
+  ~ScopedTimeCounter() {
+    IncrementCounter(id_, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start_)
+                              .count());
+  }
+  ScopedTimeCounter(const ScopedTimeCounter&) = delete;
+  ScopedTimeCounter& operator=(const ScopedTimeCounter&) = delete;
+
+ private:
+  CounterId id_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+}  // namespace rex::perf
+
+namespace rex::perf {
+
+// Begin/end and instant events from several threads, to see which thread waits on which.
+// Nothing is recorded unless armed with TimelineSetPath and made active.
+enum class TimelineEvent : uint8_t {
+  kGpuIdle,        // command thread: no commands to read
+  kGpuWaitRegMem,  // command thread: WAIT_REG_MEM on guest memory
+  kGpuFenceWait,   // command thread: blocking wait for a submission fence
+  kGpuSwap,        // command thread: IssueSwap
+  kGuestKick,      // guest moved the ring write pointer (instant)
+  kGuest0,         // free for the game's own hooks
+  kGuest1,
+  kGuest2,
+  kGuest3,
+  kGuest4,
+  kGuest5,
+  kVblankInterrupt,  // guest graphics interrupt callback, vblank source
+  kCpInterrupt,      // guest graphics interrupt callback, command processor source
+  kCount,
+};
+void TimelineSetPath(const std::string& path);
+void TimelineSetActive(bool active);
+bool TimelineActive();
+// phase: 1 begin, -1 end, 0 instant.
+void TimelineRecord(TimelineEvent event, int phase);
+void TimelineWrite();
+
+class TimelineScope {
+ public:
+  explicit TimelineScope(TimelineEvent event) : event_(event), active_(TimelineActive()) {
+    if (active_) TimelineRecord(event_, 1);
+  }
+  ~TimelineScope() {
+    if (active_) TimelineRecord(event_, -1);
+  }
+
+ private:
+  TimelineEvent event_;
+  bool active_;
+};
+
+}  // namespace rex::perf
+
 // Perf counter macros -- compile to no-ops when counters are disabled.
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 
@@ -159,6 +263,7 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS() PERF_counter_inc(kTextureCacheMisses)
 #define PROFILE_PIPELINE_CACHE_HIT() PERF_counter_inc(kPipelineCacheHits)
 #define PROFILE_PIPELINE_CACHE_MISS() PERF_counter_inc(kPipelineCacheMisses)
+#define PROFILE_SCOPE_TIME_NS(id)   ::rex::perf::ScopedTimeCounter rex_perf_scope_time_##id(::rex::perf::CounterId::id)
 
 #else
 
@@ -184,5 +289,6 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS()
 #define PROFILE_PIPELINE_CACHE_HIT()
 #define PROFILE_PIPELINE_CACHE_MISS()
+#define PROFILE_SCOPE_TIME_NS(id)
 
 #endif

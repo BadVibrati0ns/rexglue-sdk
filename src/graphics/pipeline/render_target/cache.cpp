@@ -31,6 +31,11 @@
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
+REXCVAR_DEFINE_BOOL(render_target_skip_overwritten_transfers, true, "GPU/Optimizaciones",
+                    "Don't copy the previous EDRAM contents into a render target when the draw "
+                    "taking it over overwrites all of it, like the clear rectangles drawn into "
+                    "4x MSAA targets")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, true, "GPU",
                     "Execute unclipped draw VS on CPU for PSI render backend");
 
@@ -533,6 +538,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   }
 
   // Clear ownership transfers before adding any.
+  last_update_transfer_cutout_valid_ = false;
   if (!interlock_barrier_only) {
     for (size_t i = 0; i < rex::countof(last_update_transfers_); ++i) {
       last_update_transfers_[i].clear();
@@ -683,11 +689,23 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  uint32_t overwritten_rts = 0;
+  last_update_transfer_cutout_valid_ = false;
+  if (!interlock_barrier_only && REXCVAR_GET(render_target_skip_overwritten_transfers)) {
+    overwritten_rts = GetOverwrittenRenderTargets(depth_and_color_rts_used_bits,
+                                                  normalized_depth_control, normalized_color_mask,
+                                                  vertex_shader, pitch_pixels, height_used,
+                                                  msaa_samples);
+  }
+  update_pixel_shader_may_discard_ = true;
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+                    interlock_barrier_only || ((overwritten_rts >> rt_bit_index) & 1)
+                        ? nullptr
+                        : &last_update_transfers_[rt_bit_index],
+                    last_update_transfer_cutout());
   }
 
   if (interlock_barrier_only) {
@@ -1235,6 +1253,74 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
     }
   }
   return false;
+}
+
+uint32_t RenderTargetCache::GetOverwrittenRenderTargets(
+    uint32_t depth_and_color_rts_used_bits, reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, const Shader& vertex_shader, uint32_t pitch_pixels,
+    uint32_t height_used, xenos::MsaaSamples msaa_samples) {
+  if (update_pixel_shader_may_discard_ || !height_used) {
+    return 0;
+  }
+  const RegisterFile& regs = register_file();
+  uint32_t msaa_samples_x_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t msaa_samples_y_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
+  uint32_t overwritten = 0;
+  if (depth_and_color_rts_used_bits & 1) {
+    auto stencil_writes_all = [](xenos::CompareFunction func, xenos::StencilOp zpass,
+                                 reg::RB_STENCILREFMASK ref_mask) {
+      return func == xenos::CompareFunction::kAlways && zpass == xenos::StencilOp::kReplace &&
+             ref_mask.stencilwritemask == 0xFF;
+    };
+    const reg::RB_DEPTHCONTROL& dc = normalized_depth_control;
+    if (dc.z_enable && dc.z_write_enable && dc.zfunc == xenos::CompareFunction::kAlways &&
+        dc.stencil_enable &&
+        stencil_writes_all(dc.stencilfunc, dc.stencilzpass, regs.Get<reg::RB_STENCILREFMASK>()) &&
+        (!dc.backface_enable ||
+         stencil_writes_all(dc.stencilfunc_bf, dc.stencilzpass_bf,
+                            regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)))) {
+      overwritten |= 1;
+    }
+  }
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!(depth_and_color_rts_used_bits & (uint32_t(1) << (1 + i)))) {
+      continue;
+    }
+    if (((normalized_color_mask >> (4 * i)) & 0b1111) != 0b1111) {
+      continue;
+    }
+    auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    if (blend.color_srcblend == xenos::BlendFactor::kOne &&
+        blend.color_destblend == xenos::BlendFactor::kZero &&
+        blend.color_comb_fcn == xenos::BlendOp::kAdd &&
+        blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+        blend.alpha_destblend == xenos::BlendFactor::kZero &&
+        blend.alpha_comb_fcn == xenos::BlendOp::kAdd) {
+      overwritten |= uint32_t(1) << (1 + i);
+    }
+  }
+  uint32_t x0, y0, x1, y1;
+  if (!overwritten || !draw_extent_estimator_.GetCoveredRectangle(vertex_shader, pitch_pixels,
+                                                                  height_used, x0, y0, x1, y1)) {
+    return 0;
+  }
+  // The whole range taken over, which is whole tiles: nothing to transfer to the overwritten
+  // render targets.
+  if (!x0 && !y0 && x1 == pitch_pixels && y1 == height_used &&
+      !((pitch_pixels << msaa_samples_x_log2) % xenos::kEdramTileWidthSamples) &&
+      !((height_used << msaa_samples_y_log2) % xenos::kEdramTileHeightSamples)) {
+    return overwritten;
+  }
+  // Otherwise, if every render target is overwritten in the covered part, transfer only
+  // around it.
+  if (overwritten == depth_and_color_rts_used_bits) {
+    last_update_transfer_cutout_.x_pixels = x0;
+    last_update_transfer_cutout_.y_pixels = y0;
+    last_update_transfer_cutout_.width_pixels = x1 - x0;
+    last_update_transfer_cutout_.height_pixels = y1 - y0;
+    last_update_transfer_cutout_valid_ = true;
+  }
+  return 0;
 }
 
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,

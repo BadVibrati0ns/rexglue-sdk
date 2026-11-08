@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 
 #include <rex/assert.h>
@@ -21,6 +22,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/xenos.h>
+#include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
@@ -62,6 +64,9 @@ namespace rex::graphics {
 void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
                                                       const float* value, uint32_t value_mask) {
   if (export_register == ucode::ExportRegister::kVSPosition) {
+    if (value_mask & 0b0001) {
+      position_x_ = value[0];
+    }
     if (value_mask & 0b0010) {
       position_y_ = value[1];
     }
@@ -248,6 +253,166 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   return (uint32_t(std::max(int32_t(0), max_y_24p8)) +
           ((rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X) ? 127 : 255)) >>
          8;
+}
+
+bool DrawExtentEstimator::GetCoveredRectangle(const Shader& vertex_shader, uint32_t width,
+                                              uint32_t height, uint32_t& x0_out,
+                                              uint32_t& y0_out, uint32_t& x1_out,
+                                              uint32_t& y1_out) {
+  const RegisterFile& regs = register_file_;
+
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      vgt_draw_initiator.num_indices != 3) {
+    return false;
+  }
+  if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
+      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+    return false;
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+          xenos::VGTOutputPath::kTessellationEnable) {
+    return false;
+  }
+  if (!vertex_shader.is_ucode_analyzed() || !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return false;
+  }
+
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back) {
+    return false;
+  }
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  if (pa_sc_window_offset.window_x_offset || pa_sc_window_offset.window_y_offset) {
+    return false;
+  }
+  auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+  auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  float viewport_x_scale =
+      pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
+  float viewport_x_offset =
+      pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
+  float viewport_y_scale =
+      pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
+  float viewport_y_offset =
+      pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
+
+  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+  xenos::Endian index_endian = vgt_dma_size.swap_mode;
+  const uint16_t* index_buffer_16 = nullptr;
+  const uint32_t* index_buffer_32 = nullptr;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    if (vgt_dma_size.num_words < 3) {
+      return false;
+    }
+    uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+    if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
+      if (index_endian == xenos::Endian::k8in32) {
+        index_endian = xenos::Endian::k8in16;
+      } else if (index_endian == xenos::Endian::k16in32) {
+        index_endian = xenos::Endian::kNone;
+      }
+      index_buffer_16 = reinterpret_cast<const uint16_t*>(
+          memory_.TranslatePhysical(index_buffer_base & ~uint32_t(sizeof(uint16_t) - 1)));
+    } else {
+      index_buffer_32 = reinterpret_cast<const uint32_t*>(
+          memory_.TranslatePhysical(index_buffer_base & ~uint32_t(sizeof(uint32_t) - 1)));
+    }
+  }
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionYExportSink position_export_sink;
+  shader_interpreter_.SetExportSink(&position_export_sink);
+  bool all_vertices_known = true;
+  for (uint32_t i = 0; i < 3; ++i) {
+    uint32_t vertex_index = i;
+    if (index_buffer_16) {
+      vertex_index = xenos::GpuSwap(uint32_t(index_buffer_16[i]), index_endian) & 0xFFFFFF;
+    } else if (index_buffer_32) {
+      vertex_index = xenos::GpuSwap(index_buffer_32[i], index_endian) & 0xFFFFFF;
+    }
+    vertex_index =
+        std::min(max_index, std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
+    position_export_sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if ((position_export_sink.vertex_kill().has_value() &&
+         (position_export_sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) ||
+        !position_export_sink.position_x().has_value() ||
+        !position_export_sink.position_y().has_value()) {
+      all_vertices_known = false;
+      break;
+    }
+    float x = position_export_sink.position_x().value();
+    float y = position_export_sink.position_y().value();
+    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+      if (!position_export_sink.position_w().has_value()) {
+        all_vertices_known = false;
+        break;
+      }
+      x /= position_export_sink.position_w().value();
+      y /= position_export_sink.position_w().value();
+    }
+    x = x * viewport_x_scale + viewport_x_offset;
+    y = y * viewport_y_scale + viewport_y_offset;
+    // NaN fails both comparisons and is caught by the coverage test below.
+    min_x = std::min(min_x, x);
+    min_y = std::min(min_y, y);
+    max_x = std::max(max_x, x);
+    max_y = std::max(max_y, y);
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  if (!all_vertices_known) {
+    return false;
+  }
+
+  if (!regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    // Clipped to the viewport.
+    min_x = std::max(min_x, viewport_x_offset - std::abs(viewport_x_scale));
+    max_x = std::min(max_x, viewport_x_offset + std::abs(viewport_x_scale));
+    min_y = std::max(min_y, viewport_y_offset - std::abs(viewport_y_scale));
+    max_y = std::min(max_y, viewport_y_offset + std::abs(viewport_y_scale));
+  }
+  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+    min_x += 0.5f;
+    min_y += 0.5f;
+    max_x += 0.5f;
+    max_y += 0.5f;
+  }
+  // Pixels entirely inside the rectangle (NaN fails the comparisons and gives nothing).
+  if (!(min_x <= max_x) || !(min_y <= max_y)) {
+    return false;
+  }
+  float x0 = std::max(std::ceil(min_x), 0.0f);
+  float y0 = std::max(std::ceil(min_y), 0.0f);
+  float x1 = std::min(std::floor(max_x), float(width));
+  float y1 = std::min(std::floor(max_y), float(height));
+  // Scissors.
+  x0 = std::max(x0, float(pa_sc_window_scissor_tl.tl_x));
+  y0 = std::max(y0, float(pa_sc_window_scissor_tl.tl_y));
+  x1 = std::min(x1, float(pa_sc_window_scissor_br.br_x));
+  y1 = std::min(y1, float(pa_sc_window_scissor_br.br_y));
+  x0 = std::max(x0, float(pa_sc_screen_scissor_tl.tl_x));
+  y0 = std::max(y0, float(pa_sc_screen_scissor_tl.tl_y));
+  x1 = std::min(x1, float(pa_sc_screen_scissor_br.br_x));
+  y1 = std::min(y1, float(pa_sc_screen_scissor_br.br_y));
+  if (!(x0 < x1) || !(y0 < y1)) {
+    return false;
+  }
+  x0_out = uint32_t(x0);
+  y0_out = uint32_t(y0);
+  x1_out = uint32_t(x1);
+  y1_out = uint32_t(y1);
+  return true;
 }
 
 uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,

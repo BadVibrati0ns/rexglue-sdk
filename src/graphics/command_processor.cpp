@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -36,6 +37,9 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_BOOL(gpu_type0_register_ranges, true, "GPU/Optimizaciones",
+                    "Write the registers of type 0 packets as ranges");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -217,6 +221,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      rex::perf::TimelineScope timeline_idle(rex::perf::TimelineEvent::kGpuIdle);
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
@@ -330,6 +335,9 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
   write_ptr_index_ = value;
   write_ptr_index_event_->Set();
+  if (rex::perf::TimelineActive()) {
+    rex::perf::TimelineRecord(rex::perf::TimelineEvent::kGuestKick, 0);
+  }
 }
 
 uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
@@ -339,6 +347,23 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   auto it = extended_register_values_.find(index);
   return it != extended_register_values_.end() ? it->second : 0;
 }
+
+namespace {
+// Bit per register in register_table.inc, to avoid a RegisterFile::GetRegisterInfo switch for
+// every register write.
+struct KnownRegisters {
+  std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> bits{};
+  KnownRegisters() {
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      if (RegisterFile::GetRegisterInfo(i)) {
+        bits[i >> 6] |= uint64_t(1) << (i & 63);
+      }
+    }
+  }
+  bool Contains(uint32_t index) const { return (bits[index >> 6] >> (index & 63)) & 1; }
+};
+const KnownRegisters known_registers_;
+}  // namespace
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
@@ -355,7 +380,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!known_registers_.Contains(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -614,6 +639,7 @@ void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
+  PROFILE_SCOPE_TIME_NS(kGpuBusyNs);
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
@@ -702,6 +728,11 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && REXCVAR_GET(gpu_type0_register_ranges)) {
+    // Lets the backend handle constant ranges in bulk.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -771,7 +802,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
       break;
     case PM4_WAIT_REG_MEM:
-      result = ExecutePacketType3_WAIT_REG_MEM(reader, packet, count);
+      {
+        rex::perf::TimelineScope timeline_wait(rex::perf::TimelineEvent::kGpuWaitRegMem);
+        result = ExecutePacketType3_WAIT_REG_MEM(reader, packet, count);
+      }
       break;
     case PM4_REG_RMW:
       result = ExecutePacketType3_REG_RMW(reader, packet, count);
@@ -959,6 +993,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  graphics_system_->NotifySwapProcessed();
 
   ++counter_;
   return true;
@@ -978,6 +1013,7 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
                                                        uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  PROFILE_SCOPE_TIME_NS(kGpuWaitNs);
 
   // wait until a register or memory location is a specific value
 
