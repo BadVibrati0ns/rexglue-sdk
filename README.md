@@ -46,6 +46,7 @@
 >   `/proc/self/maps` on every write-watch fault (0.4-0.7 ms each).
 > - Guest memory's `/dev/shm` name is unlinked at once, so crashes leave nothing behind.
 > - RenderDoc is used only when it is attached, not whenever its library is installed.
+> - A failed synchronous `XamEnumerate` reports zero items.
 >
 > Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
 > each game's own project.

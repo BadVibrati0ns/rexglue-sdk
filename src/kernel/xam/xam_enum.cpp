@@ -73,7 +73,10 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
 
 u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_length,
                        mapped_u32 items_returned, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
-  uint32_t dummy;
+  // Zero unless the call succeeds: xeXamEnumerate leaves the count unset for
+  // an invalid handle, and a title that checks only for a negative result
+  // would otherwise loop over whatever this local held.
+  uint32_t dummy = 0;
   auto result =
       xeXamEnumerate(handle, flags, buffer, buffer_length,
                      !overlapped.guest_address() ? &dummy : nullptr, overlapped.guest_address());
