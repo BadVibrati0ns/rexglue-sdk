@@ -25,10 +25,13 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
 
   pRENDERDOC_GetAPI get_api = nullptr;
 
-  // Try to load the RenderDoc library. If RenderDoc is attached, the library
-  // should already be loaded into the process and this will increment the
-  // reference count. If not attached, the load will fail and we return nullptr.
-  if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+  // An attached RenderDoc (launched through it, or injected) has already
+  // loaded its library into the process. Only look for it there: loading it
+  // would also succeed wherever RenderDoc is merely installed (SteamOS ships
+  // it system-wide), and RenderDoc would then wrap every Vulkan call and turn
+  // on GPU debug markers with nothing attached (a Steam Deck frame took 9.1
+  // instead of 5.3 ms).
+  if (!renderdoc_api->library_.LoadIfAlreadyLoaded(platform::lib_names::kRenderDoc)) {
     return nullptr;
   }
   get_api = renderdoc_api->library_.GetSymbol<pRENDERDOC_GetAPI>("RENDERDOC_GetAPI");
