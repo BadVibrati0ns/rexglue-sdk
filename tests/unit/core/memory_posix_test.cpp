@@ -1,7 +1,7 @@
 /**
  * @file        tests/unit/core/memory_posix_test.cpp
- * @brief       Unit tests for POSIX page-protection queries
- *              (rex::memory::QueryProtect, Protect).
+ * @brief       Unit tests for POSIX page-protection queries and file mappings
+ *              (rex::memory::QueryProtect, Protect, CreateFileMappingHandle).
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -12,8 +12,11 @@
 #if REX_PLATFORM_LINUX
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <string>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -43,6 +46,20 @@ TEST_CASE("QueryProtect reports the protection of the mapping holding an address
 
   munmap(base, page * 3);
   CHECK_FALSE(rex::memory::QueryProtect(base + page, length, access));
+}
+
+TEST_CASE("A file mapping leaves no name in /dev/shm", "[memory][posix]") {
+  const std::filesystem::path path =
+      "rex_unit_test_mapping_" + std::to_string(static_cast<long>(getpid()));
+  auto handle = rex::memory::CreateFileMappingHandle(path, 1 << 16, PageAccess::kReadWrite, true);
+  REQUIRE(handle != rex::memory::kFileMappingHandleInvalid);
+  CHECK_FALSE(std::filesystem::exists("/dev/shm/" + path.string()));
+  void* view = rex::memory::MapFileView(handle, nullptr, 1 << 16, PageAccess::kReadWrite, 0);
+  REQUIRE(view != nullptr);
+  static_cast<uint8_t*>(view)[100] = 42;
+  CHECK(static_cast<uint8_t*>(view)[100] == 42);
+  rex::memory::UnmapFileView(handle, view, 1 << 16);
+  rex::memory::CloseFileMappingHandle(handle, path);
 }
 
 #endif  // REX_PLATFORM_LINUX

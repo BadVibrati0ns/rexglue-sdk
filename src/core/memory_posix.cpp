@@ -558,9 +558,15 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
+  // The descriptor keeps the object alive and nothing opens it again by
+  // name, so drop the name now: unlinked only in CloseFileMappingHandle, a
+  // crash or a kill left it in /dev/shm holding every page the title touched
+  // (a few such leftovers fill a Steam Deck's /dev/shm, and the next launch
+  // dies with SIGBUS on its first guest memory access). The kernel frees the
+  // memory when the last descriptor and mapping go, however the process ends.
+  shm_unlink(full_path.c_str());
   if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
     close(ret);
-    shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ret);
@@ -568,11 +574,9 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+  // CreateFileMappingHandle already unlinked the name.
+  (void)path;
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
-  auto full_path = MakeShmName(path);
-  shm_unlink(full_path.c_str());
-#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
