@@ -267,6 +267,21 @@ static sem_t* RexCreateAnonymousSemaphore() {
 }
 #endif  // __APPLE__
 
+// Waits sleep to a deadline on the steady clock, at its full precision. The
+// public API takes whole milliseconds; turning what is left of a timeout back
+// into milliseconds truncates the last partial one to a zero-length wait, so
+// every timed or alertable wait spun for its final millisecond (and an
+// alertable wait in 1 ms slices spun from start to end).
+using WaitDeadline = std::chrono::steady_clock::time_point;
+
+// The deadline `timeout` from now; milliseconds::max() waits forever.
+static WaitDeadline WaitDeadlineAfter(std::chrono::milliseconds timeout) {
+  if (timeout == std::chrono::milliseconds::max()) {
+    return WaitDeadline::max();
+  }
+  return std::chrono::steady_clock::now() + timeout;
+}
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -288,6 +303,10 @@ class PosixConditionBase {
   virtual bool Signal() = 0;
 
   WaitResult Wait(std::chrono::milliseconds timeout) {
+    return WaitUntil(WaitDeadlineAfter(timeout));
+  }
+
+  WaitResult WaitUntil(WaitDeadline deadline) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
 #if REX_PLATFORM_LINUX
@@ -305,11 +324,11 @@ class PosixConditionBase {
     if (predicate()) {
       executed = true;
     } else {
-      if (timeout == std::chrono::milliseconds::max()) {
+      if (deadline == WaitDeadline::max()) {
         cond_.wait(lock, predicate);
         executed = true;  // Did not time out;
       } else {
-        executed = cond_.wait_for(lock, timeout, predicate);
+        executed = cond_.wait_until(lock, deadline, predicate);
       }
     }
     if (executed) {
@@ -321,19 +340,13 @@ class PosixConditionBase {
   }
 
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
-                                                    bool wait_all,
-                                                    std::chrono::milliseconds timeout) {
+                                                    bool wait_all, WaitDeadline deadline) {
     assert_true(!handles.empty());
 
     if (handles.size() == 1) {
-      auto result = handles[0]->Wait(timeout);
+      auto result = handles[0]->WaitUntil(deadline);
       return std::make_pair(result, 0);
     }
-
-    auto start_time = std::chrono::steady_clock::now();
-    auto end_time = (timeout == std::chrono::milliseconds::max())
-                        ? std::chrono::steady_clock::time_point::max()
-                        : start_time + timeout;
 
     while (true) {
       size_t first_signaled = std::numeric_limits<size_t>::max();
@@ -406,18 +419,12 @@ class PosixConditionBase {
 
       locks.clear();
 
+      // Poll at most every millisecond, and wake exactly at the deadline.
       auto now = std::chrono::steady_clock::now();
-      if (now >= end_time) {
+      if (now >= deadline) {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
-
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
-      }
+      std::this_thread::sleep_until(std::min(deadline, now + std::chrono::milliseconds(1)));
     }
   }
 
@@ -1089,29 +1096,14 @@ class ScopedAlertableState {
   bool alertable_;
 };
 
-std::chrono::steady_clock::time_point ComputeAlertableDeadline(std::chrono::milliseconds timeout) {
-  if (timeout == std::chrono::milliseconds::max()) {
-    return std::chrono::steady_clock::time_point::max();
-  }
-  return std::chrono::steady_clock::now() + timeout;
+bool HasAlertableTimeoutElapsed(WaitDeadline deadline) {
+  return deadline != WaitDeadline::max() && std::chrono::steady_clock::now() >= deadline;
 }
 
-bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline) {
-  return deadline != std::chrono::steady_clock::time_point::max() &&
-         std::chrono::steady_clock::now() >= deadline;
-}
-
-std::chrono::milliseconds ComputeAlertableWaitTimeout(
-    std::chrono::steady_clock::time_point deadline) {
-  if (deadline == std::chrono::steady_clock::time_point::max()) {
-    return kAlertablePollSlice;
-  }
-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-      deadline - std::chrono::steady_clock::now());
-  if (remaining <= std::chrono::milliseconds::zero()) {
-    return std::chrono::milliseconds::zero();
-  }
-  return std::min(remaining, kAlertablePollSlice);
+// The end of the next slice of an alertable wait, which checks for queued
+// user callbacks between slices.
+WaitDeadline ComputeAlertableSliceDeadline(WaitDeadline deadline) {
+  return std::min(deadline, std::chrono::steady_clock::now() + kAlertablePollSlice);
 }
 
 }  // namespace
@@ -1164,7 +1156,7 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  auto deadline = ComputeAlertableDeadline(timeout);
+  auto deadline = WaitDeadlineAfter(timeout);
 
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
@@ -1173,7 +1165,7 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
     if (HasAlertableTimeoutElapsed(deadline)) {
       return WaitResult::kTimeout;
     }
-    auto result = posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline));
+    auto result = posix_wait_handle->condition().WaitUntil(ComputeAlertableSliceDeadline(deadline));
     if (result != WaitResult::kTimeout) {
       return result;
     }
@@ -1197,7 +1189,7 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  auto deadline = ComputeAlertableDeadline(timeout);
+  auto deadline = WaitDeadlineAfter(timeout);
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
@@ -1205,7 +1197,8 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
     if (HasAlertableTimeoutElapsed(deadline)) {
       return WaitResult::kTimeout;
     }
-    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline));
+    result = posix_wait_handle_to_wait_on->condition().WaitUntil(
+        ComputeAlertableSliceDeadline(deadline));
     if (result != WaitResult::kTimeout) {
       return result;
     }
@@ -1225,11 +1218,12 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
     conditions.push_back(&handle->condition());
   }
   if (!is_alertable) {
-    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout);
+    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all,
+                                            WaitDeadlineAfter(timeout));
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  auto deadline = ComputeAlertableDeadline(timeout);
+  auto deadline = WaitDeadlineAfter(timeout);
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return std::make_pair(WaitResult::kUserCallback, 0);
@@ -1237,8 +1231,9 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
     if (HasAlertableTimeoutElapsed(deadline)) {
       return std::make_pair(WaitResult::kTimeout, 0);
     }
-    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
-                                                   wait_all, ComputeAlertableWaitTimeout(deadline));
+    auto result =
+        PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions), wait_all,
+                                         ComputeAlertableSliceDeadline(deadline));
     if (result.first != WaitResult::kTimeout) {
       return result;
     }

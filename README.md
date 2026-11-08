@@ -32,6 +32,13 @@
 > stretch of gameplay, emulated renderer at 720p internal, RTX 4090 Laptop, Linux): 50.6 fps on
 > stock v0.10.0, 154.3 fps on this branch.
 >
+> **Further fixes** in this fork, each its own commit, moved from host-side workarounds in the
+> Tony Hawk's Proving Ground recompilation (THPG-decomp) into the SDK source:
+>
+> - POSIX waits sleep to a deadline at full precision: stock truncated the remaining time to
+>   whole milliseconds, so alertable waits spun for their whole length (20 alertable 5 ms
+>   waits: 99.3 ms of CPU before, 0.6 ms after).
+>
 > Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
 > each game's own project.
 
