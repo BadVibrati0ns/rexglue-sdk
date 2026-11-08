@@ -10,6 +10,7 @@ add_executable(unit_tests
     core/hash_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    core/memory_posix_test.cpp
     core/timer_queue_test.cpp
     core/wait_test.cpp
     ppc/import_function_test.cpp

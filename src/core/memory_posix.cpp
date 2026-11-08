@@ -29,6 +29,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if REX_PLATFORM_LINUX
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif  // REX_PLATFORM_LINUX
+
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
@@ -170,9 +175,70 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
   return out.start < out.end;
 }
 
+#ifdef PROCMAP_QUERY
+// /proc/self/maps kept open for the PROCMAP_QUERY ioctl (Linux 6.11+), which
+// looks up the one mapping containing an address; -1 where the kernel lacks
+// it. Reading and parsing the whole file instead takes 0.4-0.7 ms with a
+// title's ~1,600 mappings, and QueryProtect runs on every guest write-watch
+// fault (MMIOHandler::ExceptionCallback): frames that stream textures spent
+// 30-60 ms of the guest render thread in it.
+static int ProcMapsQueryDescriptor() {
+  static const int descriptor = [] {
+    const int opened = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (opened < 0) {
+      return -1;
+    }
+    procmap_query query{};
+    query.size = sizeof(query);
+    query.query_addr = reinterpret_cast<uintptr_t>(&ProcMapsQueryDescriptor);
+    if (ioctl(opened, PROCMAP_QUERY, &query) != 0) {
+      REXSYS_INFO("PROCMAP_QUERY unavailable ({}); parsing /proc/self/maps", strerror(errno));
+      close(opened);
+      return -1;
+    }
+    return opened;
+  }();
+  return descriptor;
+}
+
+// The mapping containing `address` via PROCMAP_QUERY. Returns false when no
+// mapping contains it, or when the ioctl is unavailable (`available` false).
+static bool QueryEntryForAddress(uintptr_t address, LinuxMapEntry& out_entry, bool& available) {
+  const int descriptor = ProcMapsQueryDescriptor();
+  available = descriptor >= 0;
+  if (!available) {
+    return false;
+  }
+  procmap_query query{};
+  query.size = sizeof(query);
+  query.query_addr = address;
+  if (ioctl(descriptor, PROCMAP_QUERY, &query) != 0) {
+    return false;
+  }
+  out_entry = LinuxMapEntry{};
+  out_entry.start = static_cast<uintptr_t>(query.vma_start);
+  out_entry.end = static_cast<uintptr_t>(query.vma_end);
+  out_entry.perms[0] = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) ? 'r' : '-';
+  out_entry.perms[1] = (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) ? 'w' : '-';
+  out_entry.perms[2] = (query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) ? 'x' : '-';
+  out_entry.perms[3] = (query.vma_flags & PROCMAP_QUERY_VMA_SHARED) ? 's' : 'p';
+  return true;
+}
+#else
+static bool QueryEntryForAddress(uintptr_t, LinuxMapEntry&, bool& available) {
+  available = false;
+  return false;
+}
+#endif  // PROCMAP_QUERY
+
 // Find the mapping entry in /proc/self/maps that contains the given address
 static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+  bool query_available;
+  const bool found = QueryEntryForAddress(addr, out_entry, query_available);
+  if (query_available) {
+    return found;
+  }
   std::ifstream maps("/proc/self/maps");
   if (!maps.is_open())
     return false;
@@ -198,6 +264,20 @@ static bool IsRangeFullyMapped(void* base_address, size_t length) {
   const uintptr_t end = begin + length;
   if (end < begin) {  // overflow check
     return false;
+  }
+
+  // Walk the mappings from `begin` one lookup at a time where the kernel can.
+  LinuxMapEntry entry;
+  bool query_available;
+  uintptr_t covered = begin;
+  while (QueryEntryForAddress(covered, entry, query_available)) {
+    covered = entry.end;
+    if (covered >= end) {
+      return true;
+    }
+  }
+  if (query_available) {
+    return false;  // gap found
   }
 
   std::ifstream maps("/proc/self/maps");

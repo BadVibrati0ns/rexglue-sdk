@@ -42,6 +42,8 @@
 >   instead of spinning in disruptorplus's `spin_wait_strategy` (3.1% of a core with one 16 ms
 >   timer before, 0.06% after).
 > - `NtCreateEvent` events record their reset type (`NtQueryEvent`, save states).
+> - Page-protection lookups use the `PROCMAP_QUERY` ioctl on Linux 6.11+ instead of parsing
+>   `/proc/self/maps` on every write-watch fault (0.4-0.7 ms each).
 >
 > Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
 > each game's own project.
