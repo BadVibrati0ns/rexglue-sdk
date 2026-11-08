@@ -20,17 +20,12 @@
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
+#include "sdl_rumble_worker.h"
+
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
 namespace rex::input::sdl {
-
-namespace {
-
-// SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
-constexpr uint32_t kRumbleDurationMs = 0xFFFF;
-
-}  // namespace
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -39,9 +34,12 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       sdl_events_unflushed_(0),
       sdl_pumpevents_queued_(false),
       controllers_(),
-      controllers_mutex_() {}
+      controllers_mutex_(),
+      rumble_worker_(std::make_shared<SDLRumbleWorker>()) {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  rumble_worker_->Stop();
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -236,13 +234,15 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // XInput vibration holds until the guest changes it, but SDL rumble expires,
-  // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
-  // SDL's maximum instead; each call cancels the previous effect anyway.
-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
-                           vibration->right_motor_speed, kRumbleDurationMs)
-             ? X_ERROR_SUCCESS
-             : X_ERROR_FUNCTION_FAILED;
+  // A pad without motors fails, as SDL_RumbleGamepad would; the rumble itself
+  // happens on the worker, since a pad's force-feedback upload can block.
+  if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(controller->sdl),
+                              SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false)) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  rumble_worker_->Request(SDL_GetGamepadID(controller->sdl),
+                          {vibration->left_motor_speed, vibration->right_motor_speed});
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,

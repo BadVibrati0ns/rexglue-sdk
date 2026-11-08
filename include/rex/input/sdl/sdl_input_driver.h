@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -26,6 +27,8 @@
 #define HID_SDL_REPEAT_RATE 100
 
 namespace rex::input::sdl {
+
+class SDLRumbleWorker;
 
 class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
  public:
@@ -103,6 +106,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::vector<SDL_Event> pending_events_;
   // Never rewound, so a handle held past a disconnect resolves to nothing.
   uint64_t next_device_id_ = 1;
+  // Applies SetDeviceVibration off the calling thread (sdl_rumble_worker.h).
+  std::shared_ptr<SDLRumbleWorker> rumble_worker_;
 };
 
 }  // namespace rex::input::sdl

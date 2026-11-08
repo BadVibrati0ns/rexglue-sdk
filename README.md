@@ -47,6 +47,9 @@
 > - Guest memory's `/dev/shm` name is unlinked at once, so crashes leave nothing behind.
 > - RenderDoc is used only when it is attached, not whenever its library is installed.
 > - A failed synchronous `XamEnumerate` reports zero items.
+> - Controller rumble is applied on a worker thread, evdev pads through its own descriptor, so
+>   a virtual pad whose daemon stalls the force-feedback upload no longer freezes the game (on
+>   a Steam Deck: a 60 s stall of the caller and of input polling, now 0.2 ms).
 >
 > Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
 > each game's own project.
