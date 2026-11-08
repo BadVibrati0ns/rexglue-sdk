@@ -41,6 +41,7 @@
 > - The timer queue's dispatch thread sleeps until a timer is due or a new one is queued,
 >   instead of spinning in disruptorplus's `spin_wait_strategy` (3.1% of a core with one 16 ms
 >   timer before, 0.06% after).
+> - `NtCreateEvent` events record their reset type (`NtQueryEvent`, save states).
 >
 > Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
 > each game's own project.

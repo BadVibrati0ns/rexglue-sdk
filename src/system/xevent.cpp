@@ -24,6 +24,9 @@ void XEvent::Initialize(bool manual_reset, bool initial_state) {
 
   this->CreateNative<X_KEVENT>();
 
+  // Query (NtQueryEvent), the debug log and save states read the reset type
+  // from here, as InitializeNative and Restore record it.
+  manual_reset_ = manual_reset;
   if (manual_reset) {
     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);
   } else {
