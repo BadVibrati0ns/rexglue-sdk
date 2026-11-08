@@ -38,6 +38,9 @@
 > - POSIX waits sleep to a deadline at full precision: stock truncated the remaining time to
 >   whole milliseconds, so alertable waits spun for their whole length (20 alertable 5 ms
 >   waits: 99.3 ms of CPU before, 0.6 ms after).
+> - The timer queue's dispatch thread sleeps until a timer is due or a new one is queued,
+>   instead of spinning in disruptorplus's `spin_wait_strategy` (3.1% of a core with one 16 ms
+>   timer before, 0.06% after).
 >
 > Changes that benefit Xbox 360 games in general are added here; game-specific work stays in
 > each game's own project.
